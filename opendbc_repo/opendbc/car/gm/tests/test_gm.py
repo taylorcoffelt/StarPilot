@@ -811,3 +811,102 @@ class TestGMCarController:
     )
 
     assert get_acc_dashboard_fcw_alert(VisualAlert.none, cs) == 0x3
+
+
+class TestChevroletTrax:
+  """Pins the Chevrolet Trax (2024-25) support surface.
+
+  The Trax port is fork-local: it is not present in commaai/opendbc. Keeping its
+  touchpoints few and asserted here is what makes the port extractable into an
+  upstream PR later. Every place the platform is referenced outside of this file:
+
+    values.py       CAR.CHEVROLET_TRAX + membership in CAMERA_ACC_CAR
+    fingerprints.py FINGERPRINTS[CAR.CHEVROLET_TRAX]
+    interface.py    NON_LINEAR_TORQUE_PARAMS + the per-car block in _get_params
+    carcontroller.py membership in ACC_DASHBOARD_ZERO_RESERVED_CARS
+    torque_data/override.toml  "CHEVROLET_TRAX"
+
+  If a change adds a sixth site, it should be deliberate.
+  """
+
+  @staticmethod
+  def _params(alpha_long: bool):
+    CarInterface = interfaces[CAR.CHEVROLET_TRAX]
+    fingerprint = _empty_fingerprint()
+    fingerprint[0] = FINGERPRINTS[CAR.CHEVROLET_TRAX][0].copy()
+    # The forward camera is on the camera bus on a stock car; without it the
+    # interface sets NO_CAMERA and the safety flags below no longer apply.
+    fingerprint[2] = {gm_interface.CAM_MSG: 3}
+    return CarInterface.get_params(CAR.CHEVROLET_TRAX, fingerprint, [], alpha_long=alpha_long,
+                                   is_release=False, docs=False, starpilot_toggles=_test_starpilot_toggles())
+
+  def test_trax_is_camera_acc_only(self):
+    # The Trax integrates at the camera with no radar. It must not pick up any
+    # of the other GM integration paths, which carry different safety flags.
+    assert CAR.CHEVROLET_TRAX in CAMERA_ACC_CAR
+    assert CAR.CHEVROLET_TRAX not in (ASCM_INT | CC_ONLY_CAR)
+
+  def test_trax_fingerprints_carry_camera_diagnostic_pair(self):
+    # Enforced for every CAMERA_ACC_CAR by TestGMFingerprint, restated here so a
+    # newly captured Trax fingerprint fails loudly at the point it is added.
+    for finger in FINGERPRINTS[CAR.CHEVROLET_TRAX]:
+      assert finger.get(CAMERA_DIAGNOSTIC_ADDRESS) == 8
+      assert finger.get(CAMERA_DIAGNOSTIC_ADDRESS + GM_RX_OFFSET) == 8
+
+  def test_trax_stock_acc_defaults(self):
+    car_params = self._params(alpha_long=False)
+
+    assert not car_params.openpilotLongitudinalControl
+    assert car_params.pcmCruise
+    assert car_params.alphaLongitudinalAvailable
+    assert car_params.networkLocation == structs.CarParams.NetworkLocation.fwdCamera
+    assert car_params.radarUnavailable
+    assert car_params.minEnableSpeed == pytest.approx(5 * CV.KPH_TO_MS)
+    assert car_params.minSteerSpeed == pytest.approx(10 * CV.KPH_TO_MS)
+    assert car_params.safetyConfigs[0].safetyParam == GMSafetyFlags.HW_CAM
+    assert car_params.flags == 0
+
+  def test_trax_alpha_long_enables_openpilot_longitudinal(self):
+    car_params = self._params(alpha_long=True)
+
+    assert car_params.openpilotLongitudinalControl
+    assert not car_params.pcmCruise
+    assert not car_params.enableGasInterceptorDEPRECATED
+    assert car_params.safetyConfigs[0].safetyParam == GMSafetyFlags.HW_CAM | GMSafetyFlags.HW_CAM_LONG
+
+  def test_trax_longitudinal_tune_is_the_shared_camera_acc_tune(self):
+    # The Trax has no longitudinal tune of its own yet; it rides the generic
+    # camera-ACC values. This pins them so giving it a dedicated tune is a
+    # visible change rather than a silent drift in the shared branch.
+    car_params = self._params(alpha_long=True)
+
+    assert list(car_params.longitudinalTuning.kiBP) == pytest.approx([5.0, 35.0, 60.0])
+    assert list(car_params.longitudinalTuning.kiV) == pytest.approx([0.5, 0.5, 0.5])
+    assert car_params.stoppingDecelRate == pytest.approx(1.0)
+    assert car_params.vEgoStopping == pytest.approx(0.25)
+    assert car_params.vEgoStarting == pytest.approx(0.25)
+    assert car_params.stopAccel == pytest.approx(-0.25)
+
+  def test_trax_uses_nonlinear_torque_curve_and_override_friction(self):
+    car_params = self._params(alpha_long=False)
+
+    # steerActuatorDelay and the torque tune are set by the per-car block at the
+    # end of _get_params; the siglin curve below is what actually drives
+    # feedforward, so override.toml's LAT_ACCEL_FACTOR is only carried, not used.
+    assert car_params.steerActuatorDelay == pytest.approx(0.46)
+    assert car_params.lateralTuning.which() == 'torque'
+    assert car_params.lateralTuning.torque.friction == pytest.approx(0.17)
+
+    params = gm_interface.get_nonlinear_torque_params(CAR.CHEVROLET_TRAX)
+    assert params is not None
+    assert params["left"] == params["right"]
+
+  def test_trax_nonlinear_torque_curve_spans_full_torque_range(self):
+    # get_lataccel_torque_siglin asserts this at runtime; failing here instead
+    # points at the curve constants rather than at a car that will not start.
+    CarInterface = interfaces[CAR.CHEVROLET_TRAX]
+    car_interface = CarInterface(self._params(alpha_long=False), custom.StarPilotCarParams.new_message())
+    torque_values, _ = car_interface.get_lataccel_torque_siglin()
+
+    assert min(torque_values) < -1
+    assert max(torque_values) > 1
