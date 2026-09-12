@@ -20,24 +20,24 @@ SYSROOT_DIR_DEFAULT="${ROOT_DIR}/.comma_sysroot"
 SYSROOT_DIR="${COMMA_SYSROOT_DIR:-${SYSROOT_DIR_DEFAULT}}"
 HOST_SYSROOT_DIR="${COMMA_HOST_SYSROOT_DIR:-${SYSROOT_DIR}}"
 HOST_CACHE_DIR="${COMMA_HOST_CACHE_DIR:-${HOST_ROOT_DIR}/.cache}"
-HOST_DOCKERFILE_PATH="${COMMA_HOST_DOCKERFILE_PATH:-${HOST_ROOT_DIR}/tools/laptop_device_build/Dockerfile}"
+HOST_DOCKERFILE_PATH="${COMMA_HOST_DOCKERFILE_PATH:-${HOST_ROOT_DIR}/tools/local_device_build/Dockerfile}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/laptop_device_build.sh doctor
-  scripts/laptop_device_build.sh setup [device-host] [device-user] [ssh-port]
-  scripts/laptop_device_build.sh setup-sysroot <device-host> [device-user] [ssh-port]
-  scripts/laptop_device_build.sh setup-sysroot-agnos [manifest-path]
-  scripts/laptop_device_build.sh build-image
-  scripts/laptop_device_build.sh build [jobs] [scons args...]
-  scripts/laptop_device_build.sh scons [--no-scrub] [scons args...]
-  scripts/laptop_device_build.sh manager [jobs] [--no-build] [-- manager args...]
-  scripts/laptop_device_build.sh shell
+  scripts/local_device_build.sh doctor
+  scripts/local_device_build.sh setup [device-host] [device-user] [ssh-port]
+  scripts/local_device_build.sh setup-sysroot <device-host> [device-user] [ssh-port]
+  scripts/local_device_build.sh setup-sysroot-agnos [manifest-path]
+  scripts/local_device_build.sh build-image
+  scripts/local_device_build.sh build [jobs] [scons args...]
+  scripts/local_device_build.sh scons [--no-scrub] [scons args...]
+  scripts/local_device_build.sh manager [jobs] [--no-build] [-- manager args...]
+  scripts/local_device_build.sh shell
 
 Modes:
-  doctor        Check host/container prerequisites for laptop-side device builds.
-  setup         One-time setup for laptop builds (venv + image + sysroot).
+  doctor        Check host/container prerequisites for local machine device builds.
+  setup         One-time setup for local machine builds (venv + image + sysroot).
   setup-sysroot Sync required runtime/linker libs from a comma device over SSH.
   setup-sysroot-agnos Download AGNOS system image and extract sysroot locally.
   build-image   Build the Linux/aarch64 container image used for device-target builds.
@@ -132,7 +132,7 @@ assert_image_arch() {
   local arch
   arch="$("${engine}" image inspect "${IMAGE_NAME}" --format '{{.Architecture}}' 2>/dev/null || true)"
   if [[ "${arch}" != "arm64" ]]; then
-    err "Container image ${IMAGE_NAME} is '${arch:-unknown}', expected 'arm64'. Rebuild with: ${engine} build --pull --platform linux/arm64 -f tools/laptop_device_build/Dockerfile -t ${IMAGE_NAME} ."
+    err "Container image ${IMAGE_NAME} is '${arch:-unknown}', expected 'arm64'. Rebuild with: ${engine} build --pull --platform linux/arm64 -f tools/local_device_build/Dockerfile -t ${IMAGE_NAME} ."
   fi
 }
 
@@ -143,7 +143,7 @@ expected_capnp_version() {
   fi
 
   local dockerfile_version=""
-  dockerfile_version="$(sed -n 's/^ARG CAPNP_VERSION=\(.*\)$/\1/p' "${ROOT_DIR}/tools/laptop_device_build/Dockerfile" | head -n 1)"
+  dockerfile_version="$(sed -n 's/^ARG CAPNP_VERSION=\(.*\)$/\1/p' "${ROOT_DIR}/tools/local_device_build/Dockerfile" | head -n 1)"
   if [[ -n "${dockerfile_version}" ]]; then
     echo "${dockerfile_version}"
     return
@@ -151,7 +151,7 @@ expected_capnp_version() {
 
   local header_path="${ROOT_DIR}/cereal/gen/cpp/custom.capnp.h"
   if [[ ! -f "${header_path}" ]]; then
-    err "Unable to determine expected Cap'n Proto version. Set COMMA_EXPECTED_CAPNP_VERSION or restore tools/laptop_device_build/Dockerfile ARG CAPNP_VERSION."
+    err "Unable to determine expected Cap'n Proto version. Set COMMA_EXPECTED_CAPNP_VERSION or restore tools/local_device_build/Dockerfile ARG CAPNP_VERSION."
   fi
 
   local raw_version=""
@@ -384,7 +384,7 @@ setup_sysroot_from_agnos() {
     -v "${HOST_CACHE_DIR}:/work/.cache" \
     -w /work \
     "${IMAGE_NAME}" \
-    /usr/bin/python3 tools/laptop_device_build/extract_sysroot_from_agnos.py \
+    /usr/bin/python3 tools/local_device_build/extract_sysroot_from_agnos.py \
       --manifest "${manifest}" \
       --output-dir /opt/tici-sysroot \
       --cache-dir /work/.cache/agnos
@@ -560,7 +560,7 @@ run_larch64_build() {
   # Ensure prebuilt runtime compatibility probes can import these modules.
   # scrub_mixed_arch_artifacts clears them at the start of each run, so
   # targeted builds must always regenerate this core set.
-  # Do NOT regenerate dmonitoring_model_tinygrad.pkl on laptop builds:
+  # Do NOT regenerate dmonitoring_model_tinygrad.pkl on local machine builds:
   # it is backend-captured and should come from device/QCOM-compatible artifacts.
   echo "==> Build pass 2/2: required runtime artifacts"
   run_larch64_scons "${jobs}" \
@@ -721,7 +721,7 @@ doctor() {
   if [[ -f "${ROOT_DIR}/.venv/bin/activate" ]]; then
     echo "OK: host .venv present"
   else
-    echo "WARN: host .venv missing (run scripts/laptop_device_build.sh setup)"
+    echo "WARN: host .venv missing (run scripts/local_device_build.sh setup)"
     failed=1
   fi
 
