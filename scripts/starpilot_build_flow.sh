@@ -11,22 +11,22 @@ Usage:
   scripts/starpilot_build_flow.sh verify
   scripts/starpilot_build_flow.sh mac
   scripts/starpilot_build_flow.sh device [jobs]
-  scripts/starpilot_build_flow.sh laptop-setup [device-host]
-  scripts/starpilot_build_flow.sh laptop-device [jobs]
+  scripts/starpilot_build_flow.sh local-setup [device-host]
+  scripts/starpilot_build_flow.sh local-device [jobs]
 
 Modes:
   verify  Check critical StarPilot parity build guards in-tree.
   mac     Run macOS developer Python validation checks.
   device  Run full on-device build (comma hardware only) and set prebuilt flag.
-  laptop-setup Prepare laptop device-build environment (venv + image + sysroot).
-  laptop-device Run full device-target build in Linux/aarch64 container on laptop.
+  local-setup Prepare local machine device-build environment (venv + image + sysroot).
+  local-device Run full device-target build in Linux/aarch64 container on the local machine.
 
 Notes:
   - mac mode does NOT produce device binaries.
   - device mode must be run on comma hardware (/TICI present).
-  - laptop-device mode requires docker/podman and a prepared sysroot.
-  - prepare sysroot via scripts/laptop_device_build.sh setup-sysroot-agnos
-    or scripts/laptop_device_build.sh setup-sysroot <device-ip>.
+  - local-device mode requires docker/podman and a prepared sysroot.
+  - prepare sysroot via scripts/local_device_build.sh setup-sysroot-agnos
+    or scripts/local_device_build.sh setup-sysroot <device-ip>.
 EOF
 }
 
@@ -154,11 +154,11 @@ main() {
     device)
       build_device "${1:-$(nproc)}"
       ;;
-    laptop-setup)
-      scripts/laptop_device_build.sh setup "${1:-}" "${2:-comma}" "${3:-22}"
+    local-setup)
+      scripts/local_device_build.sh setup "${1:-}" "${2:-comma}" "${3:-22}"
       ;;
-    laptop-device)
-      scripts/laptop_device_build.sh build "${1:-8}"
+    local-device)
+      scripts/local_device_build.sh build "${1:-8}"
       ;;
     *)
       usage

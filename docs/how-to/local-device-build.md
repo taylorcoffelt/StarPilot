@@ -1,13 +1,13 @@
-# Laptop Device Build (Mac/Linux)
+# Local Machine Device Build (Mac/Linux)
 
-This flow builds **device-target (`larch64`) binaries on your laptop** using a Linux/aarch64 container and a synced comma sysroot.
+This flow builds **device-target (`larch64`) binaries on your local machine** using a Linux/aarch64 container and a synced comma sysroot.
 
 For the full StarPilot branch workflow, including host-native shorthand tools such as `./dev`, `./c3`, and `./c4`, see the [StarPilot development guide](https://github.com/firestar5683/StarPilot/blob/Dom/tools/STARPILOT_DEVELOPMENT.md).
 
 ## Prerequisites
 
 - Docker Desktop (or Podman) with Linux/aarch64 support.
-- `rsync` and `ssh` on your laptop.
+- `rsync` and `ssh` on your local machine.
 - Either:
   - access to a comma device over SSH, or
   - internet access to download AGNOS system image for sysroot extraction.
@@ -18,48 +18,48 @@ Fast path (no physical comma):
 
 ```bash
 cd /path/to/starpilot
-scripts/laptop_device_build.sh setup
+scripts/local_device_build.sh setup
 ```
 
 Equivalent wrapper:
 
 ```bash
-scripts/starpilot_build_flow.sh laptop-setup
+scripts/starpilot_build_flow.sh local-setup
 ```
 
 ### Option A: no physical comma (AGNOS-based)
 
 ```bash
 cd /path/to/starpilot
-scripts/laptop_device_build.sh build-image
-scripts/laptop_device_build.sh setup-sysroot-agnos
+scripts/local_device_build.sh build-image
+scripts/local_device_build.sh setup-sysroot-agnos
 ```
 
 ### Option B: copy sysroot from a comma device
 
 ```bash
 cd /path/to/starpilot
-scripts/laptop_device_build.sh setup-sysroot <device-ip> comma 22
-scripts/laptop_device_build.sh build-image
+scripts/local_device_build.sh setup-sysroot <device-ip> comma 22
+scripts/local_device_build.sh build-image
 ```
 
 Optional all-in-one with physical device sysroot:
 
 ```bash
-scripts/laptop_device_build.sh setup <device-ip> comma 22
+scripts/local_device_build.sh setup <device-ip> comma 22
 ```
 
 ## Build device-compatible artifacts
 
 ```bash
 cd /path/to/starpilot
-scripts/laptop_device_build.sh build
+scripts/local_device_build.sh build
 ```
 
 Equivalent wrapper:
 
 ```bash
-scripts/starpilot_build_flow.sh laptop-device
+scripts/starpilot_build_flow.sh local-device
 ```
 
 This runs:
@@ -74,7 +74,7 @@ This runs:
 To run SCons targets explicitly in the same device-compatible environment:
 
 ```bash
-scripts/laptop_device_build.sh scons common/params_pyx.so
+scripts/local_device_build.sh scons common/params_pyx.so
 ```
 
 On macOS, once `.comma_sysroot` is present, plain `scons ...` auto-routes to this containerized device build.
@@ -83,7 +83,7 @@ Set `SP_DISABLE_AUTO_DEVICE_SCONS=1` to force native host `scons`.
 ## Quick checks
 
 ```bash
-scripts/laptop_device_build.sh doctor
+scripts/local_device_build.sh doctor
 ```
 
 If `doctor` fails, fix the missing runtime/sysroot step before running `build`.
@@ -92,7 +92,7 @@ If `doctor` fails, fix the missing runtime/sysroot step before running `build`.
 
 `./launch_openpilot.sh` now auto-routes desktop/mac launches to the containerized larch64 manager path:
 
-- runs `scripts/laptop_device_build.sh doctor`
+- runs `scripts/local_device_build.sh doctor`
 - runs `setup` automatically if prerequisites are missing
 - runs container manager launch, auto-building missing runtime artifacts first
 

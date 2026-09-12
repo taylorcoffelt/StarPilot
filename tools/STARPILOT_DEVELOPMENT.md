@@ -20,27 +20,27 @@ The goal is simple: keep the device build intact, keep host tools consistent wit
 Fast path:
 
 ```bash
-scripts/laptop_device_build.sh setup
+scripts/local_device_build.sh setup
 ```
 
 Equivalent wrapper:
 
 ```bash
-scripts/starpilot_build_flow.sh laptop-setup
+scripts/starpilot_build_flow.sh local-setup
 ```
 
 If you need the manual sysroot flow instead:
 
 ```bash
-scripts/laptop_device_build.sh build-image
-scripts/laptop_device_build.sh setup-sysroot-agnos
+scripts/local_device_build.sh build-image
+scripts/local_device_build.sh setup-sysroot-agnos
 ```
 
 Or from a physical comma:
 
 ```bash
-scripts/laptop_device_build.sh setup-sysroot <device-ip> comma 22
-scripts/laptop_device_build.sh build-image
+scripts/local_device_build.sh setup-sysroot <device-ip> comma 22
+scripts/local_device_build.sh build-image
 ```
 
 ## Device-target build flow
@@ -54,7 +54,7 @@ This stays the same:
 Equivalent long form:
 
 ```bash
-scripts/laptop_device_build.sh build
+scripts/local_device_build.sh build
 ```
 
 This is the path you use for the actual comma/device-compatible build. It writes the normal device artifacts and does not depend on `.host_runtime`.
@@ -186,7 +186,7 @@ If a shorthand command fails immediately:
 
 If device builds fail:
 
-- run `scripts/laptop_device_build.sh doctor`
+- run `scripts/local_device_build.sh doctor`
 - finish the sysroot/container setup before retrying `./build`
 
 If you want to reset the host cache:
