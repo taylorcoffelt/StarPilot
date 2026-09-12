@@ -6,7 +6,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 HOST_ROOT_DIR="${COMMA_HOST_ROOT_DIR:-${ROOT_DIR}}"
-DOCKER_RUN_USER="${COMMA_DOCKER_RUN_USER:-$(id -u):$(id -g)}"
 HOST_VENV_DIR="${COMMA_HOST_VENV_DIR:-${HOST_ROOT_DIR}/.venv-linux-arm64}"
 
 # Make Docker Desktop binaries discoverable (docker + credential helpers) even
@@ -60,6 +59,31 @@ err() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || err "Missing required command: $1"
+}
+
+engine_is_rootless() {
+  local engine="$1"
+
+  if [[ "$("${engine}" info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == "true" ]]; then
+    return 0
+  fi
+
+  "${engine}" info --format '{{range .SecurityOptions}}{{.}}{{end}}' 2>/dev/null | grep -q 'name=rootless'
+}
+
+# Rootless engines map an explicit --user into the caller's subuid range, which leaves
+# bind mounts unwritable. Container root is what maps back to the invoking user there,
+# so build output still lands with correct host ownership.
+run_user() {
+  local engine="$1"
+
+  if [[ -n "${COMMA_DOCKER_RUN_USER:-}" ]]; then
+    echo "${COMMA_DOCKER_RUN_USER}"
+  elif engine_is_rootless "${engine}"; then
+    echo "0:0"
+  else
+    echo "$(id -u):$(id -g)"
+  fi
 }
 
 detect_engine() {
@@ -378,7 +402,8 @@ setup_sysroot_from_agnos() {
   mkdir -p "${SYSROOT_DIR}" "${ROOT_DIR}/.cache/agnos" "${HOST_CACHE_DIR}/agnos"
 
   "${engine}" run --rm --platform linux/arm64 \
-    --user "${DOCKER_RUN_USER}" \
+    --user "$(run_user "${engine}")" \
+    -e SP_SKIP_CONTAINER_REEXEC=1 \
     -v "${HOST_ROOT_DIR}:/work" \
     -v "${HOST_SYSROOT_DIR}:/opt/tici-sysroot" \
     -v "${HOST_CACHE_DIR}:/work/.cache" \
@@ -454,7 +479,8 @@ EOF
 )"
 
   "${engine}" run --rm --platform linux/arm64 \
-    --user "${DOCKER_RUN_USER}" \
+    --user "$(run_user "${engine}")" \
+    -e SP_SKIP_CONTAINER_REEXEC=1 \
     -v "${HOST_ROOT_DIR}:/work" \
     -v "${HOST_VENV_DIR}:/work/.venv-linux-arm64" \
     -v "${HOST_SYSROOT_DIR}:/opt/tici-sysroot:ro" \
@@ -599,7 +625,8 @@ EOF
 )"
 
   "${engine}" run --rm --platform linux/arm64 \
-    --user "${DOCKER_RUN_USER}" \
+    --user "$(run_user "${engine}")" \
+    -e SP_SKIP_CONTAINER_REEXEC=1 \
     -v "${HOST_ROOT_DIR}:/work" \
     -v "${HOST_VENV_DIR}:/work/.venv-linux-arm64" \
     -v "${HOST_SYSROOT_DIR}:/opt/tici-sysroot:ro" \
@@ -616,7 +643,8 @@ run_shell() {
   ensure_image_exists "${engine}"
   ensure_sysroot_layout
   "${engine}" run --rm -it --platform linux/arm64 \
-    --user "${DOCKER_RUN_USER}" \
+    --user "$(run_user "${engine}")" \
+    -e SP_SKIP_CONTAINER_REEXEC=1 \
     -v "${HOST_ROOT_DIR}:/work" \
     -v "${HOST_VENV_DIR}:/work/.venv-linux-arm64" \
     -v "${HOST_SYSROOT_DIR}:/opt/tici-sysroot:ro" \
