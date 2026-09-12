@@ -66,7 +66,7 @@ AddOption('--extras',
           default=os.path.exists(File('#.lfsconfig').abspath),
           help='build optional tools/tests even when minimal is the default')
 
-def maybe_delegate_to_laptop_device_builder() -> None:
+def maybe_delegate_to_local_device_builder() -> None:
   if platform.system() != "Darwin":
     return
   if os.environ.get("SP_FORCE_ARCH"):
@@ -96,11 +96,11 @@ def maybe_delegate_to_laptop_device_builder() -> None:
   if docker_bin is None and shutil.which("podman") is None:
     return
 
-  builder = os.path.join(basedir, "scripts", "laptop_device_build.sh")
+  builder = os.path.join(basedir, "scripts", "local_device_build.sh")
   if not os.path.isfile(builder):
     return
 
-  print(f"Auto-routing scons to laptop device build (sysroot: {sysroot_dir})", flush=True)
+  print(f"Auto-routing scons to local device build (sysroot: {sysroot_dir})", flush=True)
   env = os.environ.copy()
   env["SP_SKIP_CONTAINER_REEXEC"] = "1"
   env.setdefault("COMMA_SYSROOT_DIR", sysroot_dir)
@@ -111,7 +111,7 @@ def maybe_delegate_to_laptop_device_builder() -> None:
   cmd = [builder, "build", *sys.argv[1:]]
   raise SystemExit(subprocess.call(cmd, cwd=basedir, env=env))
 
-maybe_delegate_to_laptop_device_builder()
+maybe_delegate_to_local_device_builder()
 
 ## Architecture name breakdown (arch)
 ## - larch64: linux tici aarch64

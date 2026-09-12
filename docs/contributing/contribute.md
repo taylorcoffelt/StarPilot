@@ -56,7 +56,7 @@ Use `./build` when you need comma-compatible device artifacts. This is the expec
 ./build
 ```
 
-Device builds require Docker Desktop or Podman with Linux/aarch64 support and a configured comma sysroot. See the [laptop device-build guide](../how-to/laptop-device-build.md) for setup instructions and the [complete StarPilot development workflow](https://github.com/firestar5683/StarPilot/blob/Dom/tools/STARPILOT_DEVELOPMENT.md) for all host commands and troubleshooting.
+Device builds require Docker Desktop or Podman with Linux/aarch64 support and a configured comma sysroot. See the [local machine device-build guide](../how-to/local-device-build.md) for setup instructions and the [complete StarPilot development workflow](https://github.com/firestar5683/StarPilot/blob/Dom/tools/STARPILOT_DEVELOPMENT.md) for all host commands and troubleshooting.
 
 ## Code formatting
 

@@ -77,7 +77,7 @@ if [[ "${#shortcut_targets[@]}" -gt 0 ]]; then
   fi
 
   if [[ "${shortcut_includes_panda}" -eq 1 ]]; then
-    exec "${ROOT_DIR}/scripts/laptop_device_build.sh" scons "${scons_args[@]}"
+    exec "${ROOT_DIR}/scripts/local_device_build.sh" scons "${scons_args[@]}"
   fi
 
   tmpdir="$(mktemp -d)"
@@ -89,7 +89,7 @@ if [[ "${#shortcut_targets[@]}" -gt 0 ]]; then
     fi
   done
 
-  if "${ROOT_DIR}/scripts/laptop_device_build.sh" scons "${scons_args[@]}"; then
+  if "${ROOT_DIR}/scripts/local_device_build.sh" scons "${scons_args[@]}"; then
     status=0
   else
     status=$?
@@ -107,7 +107,7 @@ if [[ "${#shortcut_targets[@]}" -gt 0 ]]; then
 fi
 
 if [[ "${#original_args[@]}" -gt 0 ]]; then
-  exec "${ROOT_DIR}/scripts/laptop_device_build.sh" build "${original_args[@]}"
+  exec "${ROOT_DIR}/scripts/local_device_build.sh" build "${original_args[@]}"
 fi
 
-exec "${ROOT_DIR}/scripts/laptop_device_build.sh" build
+exec "${ROOT_DIR}/scripts/local_device_build.sh" build
