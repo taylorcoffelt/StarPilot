@@ -67,7 +67,9 @@ AddOption('--extras',
           help='build optional tools/tests even when minimal is the default')
 
 def maybe_delegate_to_local_device_builder() -> None:
-  if platform.system() != "Darwin":
+  if platform.system() not in ("Darwin", "Linux"):
+    return
+  if os.path.exists("/TICI"):
     return
   if os.environ.get("SP_FORCE_ARCH"):
     return
