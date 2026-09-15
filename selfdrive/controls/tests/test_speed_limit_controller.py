@@ -1,3 +1,5 @@
+import json
+
 from datetime import UTC, datetime
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -8,7 +10,8 @@ from cereal import custom
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.starpilot.controls.lib.speed_limit_controller import (
-  SOURCE_DASHBOARD, SOURCE_MAP, SOURCE_MAPBOX, SOURCE_NONE, SOURCE_PREVIOUS_LIMIT, SOURCE_VISION, SpeedLimitController,
+  SOURCE_DASHBOARD, SOURCE_MAP, SOURCE_MAPBOX, SOURCE_NAVIGATION, SOURCE_NONE, SOURCE_PREVIOUS_LIMIT, SOURCE_VISION,
+  SpeedLimitController,
 )
 from openpilot.starpilot.controls.lib.mapbox_speed_limit import MapboxSpeedLimit
 
@@ -195,6 +198,88 @@ def test_predicted_map_retains_only_lower_candidate(controller_factory):
   assert controller.map_speed_limit == pytest.approx(mph(55))
   step(controller, map_limit=mph(45), way=custom.WaySelectionType.possible)
   assert controller.map_speed_limit == pytest.approx(mph(45))
+
+
+def publish_nav_state(controller, *, speed_limit, next_speed_limit=0.0, next_distance=0.0, valid=True):
+  controller.starpilot_planner.params_memory.values["NavInstructionState"] = {
+    "valid": valid,
+    "speedLimit": speed_limit,
+    "nextSpeedLimit": next_speed_limit,
+    "nextSpeedLimitDistance": next_distance,
+  }
+
+
+def test_navigation_source_supplies_the_route_limit(controller_factory):
+  controller = controller_factory(speed_limit_priority1=SOURCE_NAVIGATION)
+  publish_nav_state(controller, speed_limit=mph(45))
+  step(controller, cruise=mph(65), ego=mph(45))
+  assert controller.nav_speed_limit == pytest.approx(mph(45))
+  assert controller.source == SOURCE_NAVIGATION
+  assert controller.presented_source == SOURCE_NAVIGATION
+  assert controller.target == pytest.approx(mph(45))
+
+
+def test_navigation_source_reads_json_text_from_the_param_store(controller_factory):
+  controller = controller_factory(speed_limit_priority1=SOURCE_NAVIGATION)
+  publish_nav_state(controller, speed_limit=mph(35))
+  memory = controller.starpilot_planner.params_memory
+  memory.values["NavInstructionState"] = json.dumps(memory.values["NavInstructionState"])
+  step(controller, cruise=mph(65), ego=mph(35))
+  assert controller.nav_speed_limit == pytest.approx(mph(35))
+  assert controller.source == SOURCE_NAVIGATION
+
+
+def test_navigation_source_clears_when_the_route_ends(controller_factory):
+  controller = controller_factory(speed_limit_priority1=SOURCE_NAVIGATION)
+  publish_nav_state(controller, speed_limit=mph(45))
+  step(controller, cruise=mph(65), ego=mph(45))
+  assert controller.source == SOURCE_NAVIGATION
+  controller.starpilot_planner.params_memory.remove("NavInstructionState")
+  step(controller, cruise=mph(65), ego=mph(45))
+  assert controller.nav_speed_limit == 0
+  assert controller.source == SOURCE_NONE
+
+
+def test_navigation_source_ignores_an_invalidated_route(controller_factory):
+  controller = controller_factory(speed_limit_priority1=SOURCE_NAVIGATION)
+  publish_nav_state(controller, speed_limit=mph(45), valid=False)
+  step(controller, cruise=mph(65), ego=mph(45))
+  assert controller.nav_speed_limit == 0
+  assert controller.source == SOURCE_NONE
+
+
+@pytest.mark.parametrize(("next_distance", "expected_speed"), [(200.0, 45), (1000.0, 65)])
+def test_navigation_source_adopts_a_lower_limit_only_inside_the_lookahead(controller_factory, next_distance, expected_speed):
+  controller = controller_factory(speed_limit_priority1=SOURCE_NAVIGATION, map_speed_lookahead_lower=10.0)
+  publish_nav_state(controller, speed_limit=mph(65), next_speed_limit=mph(45), next_distance=next_distance)
+  step(controller, cruise=mph(65), ego=mph(65))
+  assert controller.nav_speed_limit == pytest.approx(mph(expected_speed))
+  assert controller.target == pytest.approx(mph(expected_speed))
+
+
+def test_navigation_source_is_not_consulted_when_it_holds_no_priority(controller_factory):
+  controller = controller_factory()
+  publish_nav_state(controller, speed_limit=mph(45))
+  step(controller, cruise=mph(65), ego=mph(45))
+  assert controller.nav_speed_limit == pytest.approx(mph(45))
+  assert controller.source == SOURCE_NONE
+
+
+def test_navigation_source_wins_when_lowest_is_configured(controller_factory):
+  controller = controller_factory(speed_limit_priority_lowest=True)
+  publish_nav_state(controller, speed_limit=mph(35))
+  step(controller, dashboard=mph(65), cruise=mph(65), ego=mph(45))
+  assert controller.source == SOURCE_NAVIGATION
+  assert controller.target == pytest.approx(mph(35))
+
+
+def test_inactive_controller_clears_navigation_limits(controller_factory):
+  controller = controller_factory(speed_limit_priority1=SOURCE_NAVIGATION)
+  publish_nav_state(controller, speed_limit=mph(65), next_speed_limit=mph(45), next_distance=1000.0)
+  step(controller, cruise=mph(65), ego=mph(65))
+  step(controller, active=False)
+  assert controller.nav_speed_limit == 0
+  assert controller.nav_next_speed_limit == 0
 
 
 def test_mapbox_fills_absence_and_resets_for_primary_source(controller_factory):

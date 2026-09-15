@@ -6,15 +6,17 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 
 from cereal import custom
 from openpilot.starpilot.controls.lib.mapbox_speed_limit import MapboxSpeedLimit
+from openpilot.starpilot.navigation.destination_store import NAV_INSTRUCTION_STATE_KEY, parse_nav_instruction_state
 
 
 SOURCE_NONE = "None"
 SOURCE_DASHBOARD = "Dashboard"
 SOURCE_MAP = "Map Data"
+SOURCE_NAVIGATION = "Navigation"
 SOURCE_VISION = "Vision"
 SOURCE_MAPBOX = "Mapbox"
 SOURCE_PREVIOUS_LIMIT = "Previous Limit"
-REAL_SOURCES = (SOURCE_DASHBOARD, SOURCE_MAP, SOURCE_VISION, SOURCE_MAPBOX)
+REAL_SOURCES = (SOURCE_DASHBOARD, SOURCE_MAP, SOURCE_NAVIGATION, SOURCE_VISION, SOURCE_MAPBOX)
 
 OFFSET_MAP_IMPERIAL = [
   (0, 11.2, "speed_limit_offset1"),     # 0–24 mph
@@ -54,6 +56,8 @@ class SpeedLimitController:
     self.target = 0.0
     self.map_speed_limit = 0.0
     self.next_speed_limit = 0.0
+    self.nav_speed_limit = 0.0
+    self.nav_next_speed_limit = 0.0
     self.vision_limit = 0.0
     self.overridden_speed = 0.0
 
@@ -164,6 +168,18 @@ class SpeedLimitController:
         return 0.0
     return limit
 
+  def _lookahead_promoted_limit(self, *, current_limit, next_limit, distance_to_next_m, v_ego):
+    """Adopts an upcoming limit once it is inside the configured lookahead time."""
+    if next_limit <= 0:
+      return current_limit
+    if current_limit < next_limit:
+      lookahead = self.starpilot_toggles.map_speed_lookahead_higher * v_ego
+    elif current_limit > next_limit:
+      lookahead = self.starpilot_toggles.map_speed_lookahead_lower * v_ego
+    else:
+      return current_limit
+    return next_limit if distance_to_next_m < lookahead else current_limit
+
   def _update_map_speed_limit(self, v_ego, sm):
     map_data = sm["mapdOut"]
     way_sel = map_data.waySelectionType
@@ -180,19 +196,32 @@ class SpeedLimitController:
       self.map_speed_limit = 0.0
       self.next_speed_limit = 0.0
 
-    if self.next_speed_limit > 0:
-      if self.map_speed_limit < self.next_speed_limit:
-        lookahead = self.starpilot_toggles.map_speed_lookahead_higher * v_ego
-      elif self.map_speed_limit > self.next_speed_limit:
-        lookahead = self.starpilot_toggles.map_speed_lookahead_lower * v_ego
-      else:
-        lookahead = 0.0
-      if map_data.nextSpeedLimitDistance < lookahead:
-        self.map_speed_limit = self.next_speed_limit
+    self.map_speed_limit = self._lookahead_promoted_limit(
+      current_limit=self.map_speed_limit,
+      next_limit=self.next_speed_limit,
+      distance_to_next_m=map_data.nextSpeedLimitDistance,
+      v_ego=v_ego,
+    )
 
-  def _select_limit(self, dashboard, map_limit, vision_limit):
+  def _update_nav_speed_limit(self, v_ego):
+    # Removing the param is how a finished or invalidated route retires this source.
+    state = parse_nav_instruction_state(self.starpilot_planner.params_memory.get(NAV_INSTRUCTION_STATE_KEY))
+    if not state.get("valid", False):
+      self.nav_speed_limit = 0.0
+      self.nav_next_speed_limit = 0.0
+      return
+
+    self.nav_next_speed_limit = float(state.get("nextSpeedLimit") or 0.0)
+    self.nav_speed_limit = self._lookahead_promoted_limit(
+      current_limit=float(state.get("speedLimit") or 0.0),
+      next_limit=self.nav_next_speed_limit,
+      distance_to_next_m=float(state.get("nextSpeedLimitDistance") or 0.0),
+      v_ego=v_ego,
+    )
+
+  def _select_limit(self, dashboard, *, map_limit, nav_limit, vision_limit):
     priorities = (self.starpilot_toggles.speed_limit_priority1, self.starpilot_toggles.speed_limit_priority2)
-    limits = {SOURCE_DASHBOARD: dashboard, SOURCE_MAP: map_limit}
+    limits = {SOURCE_DASHBOARD: dashboard, SOURCE_MAP: map_limit, SOURCE_NAVIGATION: nav_limit}
     if SOURCE_VISION in priorities:
       limits[SOURCE_VISION] = vision_limit
     valid = {source: limit for source, limit in limits.items() if limit >= 1}
@@ -412,11 +441,15 @@ class SpeedLimitController:
       self.mapbox.reset()
       self.source, self.target = SOURCE_NONE, 0.0
       self.map_speed_limit = self.next_speed_limit = self.vision_limit = 0.0
+      self.nav_speed_limit = self.nav_next_speed_limit = 0.0
       return
 
     self._update_map_speed_limit(v_ego, sm)
+    self._update_nav_speed_limit(v_ego)
     vision_limit = self._get_vision_limit(v_ego, sm, display_only)
-    source, limit = self._select_limit(dashboard_speed_limit, self.map_speed_limit, vision_limit)
+    source, limit = self._select_limit(
+      dashboard_speed_limit, map_limit=self.map_speed_limit, nav_limit=self.nav_speed_limit, vision_limit=vision_limit,
+    )
     source, limit = self._apply_mapbox_filler(source, limit, now, time_validated, v_ego, sm)
 
     if display_only:

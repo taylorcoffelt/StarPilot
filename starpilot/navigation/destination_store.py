@@ -45,6 +45,16 @@ def _json_value(raw_value: Any, default: Any) -> Any:
     return default
 
 
+def parse_nav_instruction_state(raw_value: Any) -> dict[str, Any]:
+  """The published navigation state as a dict.
+
+  The param store hands back JSON text on device and an already-parsed value in
+  tests, so both have to read the same.
+  """
+  state = _json_value(raw_value, {})
+  return state if isinstance(state, dict) else {}
+
+
 def _param_get(params: Any, key: str, default: Any = "") -> Any:
   try:
     return params.get(key, encoding="utf-8", default=default)

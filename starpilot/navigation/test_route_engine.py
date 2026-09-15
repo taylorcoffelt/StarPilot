@@ -1,5 +1,8 @@
+import pytest
+
 from cereal import log
 
+from openpilot.common.constants import CV
 from openpilot.starpilot.navigation.route_engine import Coordinate, NavigationRoute
 
 
@@ -170,3 +173,30 @@ def test_lane_payload_uses_capnp_enum_names():
     log.NavInstruction.Direction.slightLeft,
   ]
   assert msg.navInstruction.lanes[0].activeDirection == log.NavInstruction.Direction.slightLeft
+
+
+def test_route_progress_reports_the_next_posted_limit_change():
+  route = make_route()
+  progress = route.get_progress(Coordinate(0.0, 0.0005))
+
+  assert progress is not None
+  assert progress.current_step_index == 0
+  assert progress.current_speed_limit_ms == pytest.approx(35.0 * CV.MPH_TO_MS)
+  assert progress.next_speed_limit_ms == pytest.approx(25.0 * CV.MPH_TO_MS)
+  assert progress.distance_to_next_speed_limit_m > 0.0
+
+  payload = route.build_instruction_payload(progress)
+  assert payload["speedLimit"] == pytest.approx(35.0 * CV.MPH_TO_MS)
+  assert payload["nextSpeedLimit"] == pytest.approx(25.0 * CV.MPH_TO_MS)
+  assert payload["nextSpeedLimitDistance"] == pytest.approx(progress.distance_to_next_speed_limit_m)
+
+
+def test_route_progress_reports_no_change_when_the_limit_holds_to_the_destination():
+  route = make_route()
+  progress = route.get_progress(Coordinate(0.0, 0.002))
+
+  assert progress is not None
+  assert progress.current_step_index == 1
+  assert progress.current_speed_limit_ms == pytest.approx(25.0 * CV.MPH_TO_MS)
+  assert progress.next_speed_limit_ms == 0.0
+  assert progress.distance_to_next_speed_limit_m == 0.0
