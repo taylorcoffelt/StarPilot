@@ -1,3 +1,5 @@
+import json
+
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -1056,5 +1058,131 @@ def test_override_clears_after_sustained_disengage():
 
     assert controller.overridden_speed == 0
     assert not controller.override_slc
+  finally:
+    controller.shutdown()
+
+
+def make_nav_state(*, speed_limit, next_speed_limit=0.0, next_distance=0.0, valid=True):
+  return {
+    "valid": valid,
+    "speedLimit": speed_limit,
+    "nextSpeedLimit": next_speed_limit,
+    "nextSpeedLimitDistance": next_distance,
+  }
+
+
+def test_navigation_source_supplies_the_route_limit():
+  controller = make_controller(speed_limit_priority1="Navigation")
+  try:
+    controller.starpilot_planner.params_memory.put_nonblocking("NavInstructionState", make_nav_state(speed_limit=mph(45)))
+
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(45), make_sm(gas_pressed=False))
+
+    assert controller.nav_speed_limit == pytest.approx(mph(45))
+    assert controller.target == pytest.approx(mph(45))
+    assert controller.source == "Navigation"
+  finally:
+    controller.shutdown()
+
+
+def test_navigation_source_reads_json_text_from_the_param_store():
+  controller = make_controller(speed_limit_priority1="Navigation")
+  try:
+    state = json.dumps(make_nav_state(speed_limit=mph(35)))
+    controller.starpilot_planner.params_memory.put_nonblocking("NavInstructionState", state)
+
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(35), make_sm(gas_pressed=False))
+
+    assert controller.nav_speed_limit == pytest.approx(mph(35))
+    assert controller.source == "Navigation"
+  finally:
+    controller.shutdown()
+
+
+def test_navigation_source_clears_when_the_route_ends():
+  controller = make_controller(speed_limit_priority1="Navigation")
+  try:
+    controller.starpilot_planner.params_memory.put_nonblocking("NavInstructionState", make_nav_state(speed_limit=mph(45)))
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(45), make_sm(gas_pressed=False))
+    assert controller.source == "Navigation"
+
+    controller.starpilot_planner.params_memory.remove("NavInstructionState")
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(45), make_sm(gas_pressed=False))
+
+    assert controller.nav_speed_limit == 0
+    assert controller.source == "None"
+  finally:
+    controller.shutdown()
+
+
+def test_navigation_source_ignores_an_invalidated_route():
+  controller = make_controller(speed_limit_priority1="Navigation")
+  try:
+    controller.starpilot_planner.params_memory.put_nonblocking(
+      "NavInstructionState", make_nav_state(speed_limit=mph(45), valid=False)
+    )
+
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(45), make_sm(gas_pressed=False))
+
+    assert controller.nav_speed_limit == 0
+    assert controller.source == "None"
+  finally:
+    controller.shutdown()
+
+
+def test_navigation_source_adopts_a_lower_upcoming_limit_inside_the_lookahead():
+  controller = make_controller(speed_limit_priority1="Navigation", map_speed_lookahead_lower=10.0)
+  try:
+    controller.starpilot_planner.params_memory.put_nonblocking(
+      "NavInstructionState",
+      make_nav_state(speed_limit=mph(65), next_speed_limit=mph(45), next_distance=200.0),
+    )
+
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(65), make_sm(gas_pressed=False))
+
+    assert controller.nav_speed_limit == pytest.approx(mph(45))
+    assert controller.target == pytest.approx(mph(45))
+  finally:
+    controller.shutdown()
+
+
+def test_navigation_source_holds_until_the_next_limit_is_inside_the_lookahead():
+  controller = make_controller(speed_limit_priority1="Navigation", map_speed_lookahead_lower=10.0)
+  try:
+    controller.starpilot_planner.params_memory.put_nonblocking(
+      "NavInstructionState",
+      make_nav_state(speed_limit=mph(65), next_speed_limit=mph(45), next_distance=1000.0),
+    )
+
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(65), make_sm(gas_pressed=False))
+
+    assert controller.nav_speed_limit == pytest.approx(mph(65))
+    assert controller.target == pytest.approx(mph(65))
+  finally:
+    controller.shutdown()
+
+
+def test_navigation_source_is_not_consulted_when_it_holds_no_priority():
+  controller = make_controller(speed_limit_priority1="Dashboard", speed_limit_priority2="None")
+  try:
+    controller.starpilot_planner.params_memory.put_nonblocking("NavInstructionState", make_nav_state(speed_limit=mph(45)))
+
+    controller.update_limits(0.0, datetime.now(timezone.utc), False, mph(65), mph(45), make_sm(gas_pressed=False))
+
+    assert controller.nav_speed_limit == pytest.approx(mph(45))
+    assert controller.source == "None"
+  finally:
+    controller.shutdown()
+
+
+def test_navigation_source_wins_when_lowest_is_configured():
+  controller = make_controller(speed_limit_priority1="Lowest", speed_limit_priority_lowest=True)
+  try:
+    controller.starpilot_planner.params_memory.put_nonblocking("NavInstructionState", make_nav_state(speed_limit=mph(35)))
+
+    controller.update_limits(mph(65), datetime.now(timezone.utc), False, mph(65), mph(45), make_sm(gas_pressed=False))
+
+    assert controller.target == pytest.approx(mph(35))
+    assert controller.source == "Navigation"
   finally:
     controller.shutdown()

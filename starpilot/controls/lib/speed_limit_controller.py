@@ -11,7 +11,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 
 from cereal import custom
-from openpilot.starpilot.common.starpilot_utilities import calculate_bearing_offset, calculate_distance_to_point, is_url_pingable
+from openpilot.starpilot.common.starpilot_utilities import calculate_bearing_offset, is_url_pingable
+from openpilot.starpilot.navigation.destination_store import NAV_INSTRUCTION_STATE_KEY, parse_nav_instruction_state
 
 FREE_MAPBOX_REQUESTS = 100_000
 
@@ -58,6 +59,8 @@ class SpeedLimitController:
     self.denied_target = 0
     self.map_speed_limit = 0
     self.mapbox_limit = 0
+    self.nav_next_speed_limit = 0
+    self.nav_speed_limit = 0
     self.next_speed_limit = 0
     self.overridden_speed = 0
     self.segment_distance = 0
@@ -192,11 +195,8 @@ class SpeedLimitController:
 
         future_latitude, future_longitude = calculate_bearing_offset(current_latitude, current_longitude, current_bearing, v_ego)
 
-        url = (
-          f"{self.mapbox_host}/matching/v5/mapbox/driving/"
-          f"{current_longitude},{current_latitude};"
-          f"{future_longitude},{future_latitude}.json"
-        )
+        waypoints = f"{current_longitude},{current_latitude};{future_longitude},{future_latitude}"
+        url = f"{self.mapbox_host}/matching/v5/mapbox/driving/{waypoints}.json"
 
         mapbox_params = {
           "access_token": self.mapbox_token,
@@ -352,6 +352,7 @@ class SpeedLimitController:
 
   def update_limits(self, dashboard_speed_limit, now, time_validated, v_cruise, v_ego, sm, display_only=False):
     self.update_map_speed_limit(v_ego, sm)
+    self.update_nav_speed_limit(v_ego)
     vision_enabled = getattr(self.starpilot_toggles, "vision_speed_limit_detection", False)
     self.vision_limit = self.starpilot_planner.params_memory.get_float("VisionSpeedLimit") if vision_enabled else 0
     usable_vision_limit = self.vision_limit
@@ -377,6 +378,7 @@ class SpeedLimitController:
     limits = {
       "Dashboard": dashboard_speed_limit,
       "Map Data": self.map_speed_limit,
+      "Navigation": self.nav_speed_limit,
     }
     if "Vision" in configured_priorities:
       limits["Vision"] = usable_vision_limit
@@ -497,6 +499,44 @@ class SpeedLimitController:
         self.starpilot_planner.params.put_nonblocking("PreviousSpeedLimit", float(self.target))
         self.starpilot_planner.params_memory.put_float("SLCForceCruiseSpeed", self.target + self.offset)
 
+  def lookahead_promoted_limit(self, *, current_limit, next_limit, distance_to_next_m, v_ego):
+    """Adopts an upcoming limit early, once it is inside the configured lookahead.
+
+    The lookahead is a time, so it scales with speed: dropping from 70 to 45 has
+    to start well before the sign, while a rise can wait until it is close.
+    """
+    if next_limit <= 0:
+      return current_limit
+
+    if current_limit < next_limit:
+      max_lookahead = self.starpilot_toggles.map_speed_lookahead_higher * v_ego
+    elif current_limit > next_limit:
+      max_lookahead = self.starpilot_toggles.map_speed_lookahead_lower * v_ego
+    else:
+      return current_limit
+
+    return next_limit if distance_to_next_m < max_lookahead else current_limit
+
+  def update_nav_speed_limit(self, v_ego):
+    """The active route's own posted limits, from whichever engine published the nav state.
+
+    Removing the param is how a finished or invalidated route retires the source,
+    so an absent state has to clear the limit rather than hold the last one.
+    """
+    state = parse_nav_instruction_state(self.starpilot_planner.params_memory.get(NAV_INSTRUCTION_STATE_KEY))
+    if not state.get("valid", False):
+      self.nav_speed_limit = 0
+      self.nav_next_speed_limit = 0
+      return
+
+    self.nav_next_speed_limit = float(state.get("nextSpeedLimit") or 0.0)
+    self.nav_speed_limit = self.lookahead_promoted_limit(
+      current_limit=float(state.get("speedLimit") or 0.0),
+      next_limit=self.nav_next_speed_limit,
+      distance_to_next_m=float(state.get("nextSpeedLimitDistance") or 0.0),
+      v_ego=v_ego,
+    )
+
   def update_map_speed_limit(self, v_ego, sm):
     next_speed_limit_distance = sm["mapdOut"].nextSpeedLimitDistance
 
@@ -514,16 +554,12 @@ class SpeedLimitController:
     else:
       self.next_speed_limit = 0
 
-    if self.next_speed_limit > 0:
-      if self.map_speed_limit < self.next_speed_limit:
-        max_lookahead = self.starpilot_toggles.map_speed_lookahead_higher * v_ego
-      elif self.map_speed_limit > self.next_speed_limit:
-        max_lookahead = self.starpilot_toggles.map_speed_lookahead_lower * v_ego
-      else:
-        max_lookahead = 0
-
-      if next_speed_limit_distance < max_lookahead:
-        self.map_speed_limit = self.next_speed_limit
+    self.map_speed_limit = self.lookahead_promoted_limit(
+      current_limit=self.map_speed_limit,
+      next_limit=self.next_speed_limit,
+      distance_to_next_m=next_speed_limit_distance,
+      v_ego=v_ego,
+    )
 
   def update_override(self, v_cruise, v_cruise_diff, v_ego, v_ego_diff, sm):
     # Detect +/- changes on the raw set speed (button-driven, no cluster jitter). A fresh edge

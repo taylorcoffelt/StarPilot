@@ -203,7 +203,13 @@ class Navigationd:
       "now": now,
     }
 
-  def _maybe_recompute(self, route: NavigationRoute | None, destination: dict[str, object] | None, progress: RouteProgress | None, route_state: dict[str, object] | None) -> None:
+  def _maybe_recompute(
+    self,
+    route: NavigationRoute | None,
+    destination: dict[str, object] | None,
+    progress: RouteProgress | None,
+    route_state: dict[str, object] | None,
+  ) -> None:
     if route is None or destination is None or progress is None or route_state is None:
       return
 
@@ -315,6 +321,9 @@ class Navigationd:
       "nextManeuverType": str(next_maneuver.get("type") or ""),
       "nextManeuverModifier": str(next_maneuver.get("modifier") or ""),
       "nextManeuverDistance": float(next_maneuver.get("distance") or 0.0),
+      "speedLimit": float(payload.get("speedLimit") or 0.0),
+      "nextSpeedLimit": float(payload.get("nextSpeedLimit") or 0.0),
+      "nextSpeedLimitDistance": float(payload.get("nextSpeedLimitDistance") or 0.0),
     }
     if state != self._last_nav_state:
       self.params_memory.put_nonblocking("NavInstructionState", state)

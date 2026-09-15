@@ -25,6 +25,10 @@ UPCOMING_TURN_SPEED_BREAKPOINTS = [0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0,
 UPCOMING_TURN_DISTANCE_BREAKPOINTS = [20.0, 25.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0]
 UTURN_MODIFIER = "uturn"
 
+# Mapbox posts one maxspeed per step, so runs of identical limits are normal. Two
+# limits closer than this are the same sign, not an upcoming change.
+SPEED_LIMIT_SAME_SIGN_TOLERANCE_MS = 0.1
+
 LANE_DIRECTIONS = frozenset({
   "none",
   "left",
@@ -40,19 +44,19 @@ class Coordinate:
   latitude: float
   longitude: float
 
-  def __sub__(self, other: "Coordinate") -> "Coordinate":
+  def __sub__(self, other: Coordinate) -> Coordinate:
     return Coordinate(self.latitude - other.latitude, self.longitude - other.longitude)
 
-  def __add__(self, other: "Coordinate") -> "Coordinate":
+  def __add__(self, other: Coordinate) -> Coordinate:
     return Coordinate(self.latitude + other.latitude, self.longitude + other.longitude)
 
-  def __mul__(self, scale: float) -> "Coordinate":
+  def __mul__(self, scale: float) -> Coordinate:
     return Coordinate(self.latitude * scale, self.longitude * scale)
 
-  def dot(self, other: "Coordinate") -> float:
+  def dot(self, other: Coordinate) -> float:
     return self.latitude * other.latitude + self.longitude * other.longitude
 
-  def distance_to(self, other: "Coordinate") -> float:
+  def distance_to(self, other: Coordinate) -> float:
     dlat = math.radians(other.latitude - self.latitude)
     dlon = math.radians(other.longitude - self.longitude)
 
@@ -88,6 +92,8 @@ class RouteProgress:
   distance_remaining: float
   time_remaining: float
   current_speed_limit_ms: float
+  next_speed_limit_ms: float
+  distance_to_next_speed_limit_m: float
   all_maneuvers: list[dict[str, Any]]
 
 
@@ -216,7 +222,7 @@ class NavigationRoute:
   total_duration: float
 
   @classmethod
-  def from_mapbox_route(cls, route_data: dict[str, Any]) -> "NavigationRoute" | None:
+  def from_mapbox_route(cls, route_data: dict[str, Any]) -> NavigationRoute | None:
     geometry_data = route_data.get("geometry") or []
     steps_data = route_data.get("steps") or []
     if not geometry_data or not steps_data:
@@ -320,6 +326,10 @@ class NavigationRoute:
         "modifier": step.modifier,
       })
 
+    next_speed_limit_ms, distance_to_next_speed_limit_m = self.next_speed_limit_change(
+      current_step.maxspeed_ms, next_step_index, closest_cumulative
+    )
+
     return RouteProgress(
       closest_index=closest_index,
       closest_segment_index=closest_segment_index,
@@ -331,8 +341,23 @@ class NavigationRoute:
       distance_remaining=distance_remaining,
       time_remaining=time_remaining,
       current_speed_limit_ms=current_step.maxspeed_ms,
+      next_speed_limit_ms=next_speed_limit_ms,
+      distance_to_next_speed_limit_m=distance_to_next_speed_limit_m,
       all_maneuvers=all_maneuvers,
     )
+
+  def next_speed_limit_change(self, current_limit_ms: float, from_step_index: int, closest_cumulative: float) -> tuple[float, float]:
+    """The first step ahead posting a different limit, as (limit in m/s, metres away).
+
+    Returns (0.0, 0.0) when the limit holds to the destination. A step with no
+    posted limit reports 0.0, which is also how the consumer reads "unknown" —
+    that stretch must clear the limit rather than inherit the previous one.
+    """
+    for step in self.steps[max(from_step_index, 0):]:
+      if math.isclose(step.maxspeed_ms, current_limit_ms, abs_tol=SPEED_LIMIT_SAME_SIGN_TOLERANCE_MS):
+        continue
+      return step.maxspeed_ms, max(0.0, step.cumulative_distance - closest_cumulative)
+    return 0.0, 0.0
 
   def upcoming_turn_modifier(self, progress: RouteProgress, position: Coordinate, v_ego: float) -> str:
     if progress.next_step is None:
@@ -351,7 +376,11 @@ class NavigationRoute:
     if v_ego >= 2.0 or not progress.all_maneuvers:
       return False
     current = progress.all_maneuvers[0]
-    destination_step = current["type"] == "arrive" or progress.current_step.maneuver == "arrive" or progress.current_step.instruction.startswith("Your destination")
+    destination_step = (
+      current["type"] == "arrive"
+      or progress.current_step.maneuver == "arrive"
+      or progress.current_step.instruction.startswith("Your destination")
+    )
     if not destination_step and progress.next_step is not None:
       destination_step = progress.next_step.maneuver == "arrive" and progress.distance_to_end_of_step <= max(15.0, v_ego * 8.0)
     return destination_step and progress.distance_remaining <= 40.0
@@ -384,6 +413,8 @@ class NavigationRoute:
       "lanes": lanes,
       "showFull": bool(parsed.get("showFull", True)),
       "speedLimit": progress.current_speed_limit_ms,
+      "nextSpeedLimit": progress.next_speed_limit_ms,
+      "nextSpeedLimitDistance": progress.distance_to_next_speed_limit_m,
       "speedLimitSign": log.NavInstruction.SpeedLimitSign.vienna if use_vienna_sign else log.NavInstruction.SpeedLimitSign.mutcd,
       "allManeuvers": progress.all_maneuvers,
     }

@@ -2225,6 +2225,10 @@
             "label": "Map Data"
           },
           {
+            "value": "Navigation",
+            "label": "Navigation"
+          },
+          {
             "value": "Vision",
             "label": "Vision"
           },
@@ -2259,6 +2263,10 @@
           {
             "value": "Map Data",
             "label": "Map Data"
+          },
+          {
+            "value": "Navigation",
+            "label": "Navigation"
           },
           {
             "value": "Vision",
