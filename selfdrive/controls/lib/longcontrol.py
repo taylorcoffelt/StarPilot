@@ -18,8 +18,11 @@ MOVING_STOP_FOLLOW_MIN_GAP = 0.25
 NEGATIVE_TARGET_CREEP_GUARD_SPEED = 0.35
 NEGATIVE_TARGET_CREEP_GUARD_DECEL = 0.40
 MODE_TRANSITION_MAX_DECEL = 4.0
-TESLA_PEDAL_RELEASE_GUARD_TIME = 0.15
-TESLA_PEDAL_RELEASE_GUARD_MAX_DECEL = 0.35
+# Defaults inherited from the Tesla-only implementation this generalises. Suited to a
+# drivetrain that responds immediately; a turbo engine still building boost as the driver
+# lifts off needs a longer window (PedalReleaseGuardTime).
+PEDAL_RELEASE_GUARD_TIME_S = 0.15
+PEDAL_RELEASE_GUARD_MAX_DECEL = 0.35
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
@@ -242,8 +245,11 @@ class LongControl:
 
     if self.pedal_override_active:
       self.pedal_override_active = False
+      guard_time_s = getattr(starpilot_toggles, "pedal_release_guard_time", 0.0)
+      if not guard_time_s:
+        guard_time_s = PEDAL_RELEASE_GUARD_TIME_S
       self.pedal_override_release_frames = max(
-        1, int(round(TESLA_PEDAL_RELEASE_GUARD_TIME / DT_CTRL)),
+        1, int(round(float(guard_time_s) / DT_CTRL)),
       )
 
     previous_long_control_state = self.long_control_state
@@ -365,7 +371,7 @@ class LongControl:
 
     if self.pedal_override_release_frames > 0:
       self.pedal_override_release_frames -= 1
-      if not should_stop and -TESLA_PEDAL_RELEASE_GUARD_MAX_DECEL < output_accel < 0.0:
+      if not should_stop and -PEDAL_RELEASE_GUARD_MAX_DECEL < output_accel < 0.0:
         output_accel = 0.0
 
     self.last_output_accel = clip(output_accel, accel_limits[0], accel_limits[1])

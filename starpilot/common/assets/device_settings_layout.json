@@ -1776,6 +1776,37 @@
         "settings_tier": "simple"
       },
       {
+        "key": "PedalReleaseGuard",
+        "label": "Smooth Pedal Hand-off",
+        "description": "When you use the gas pedal while engaged, keep the longitudinal controller running instead of resetting it, and briefly ignore light braking after you lift off.\n\nThis stops openpilot grabbing the brakes the instant you release the pedal, which matters on turbocharged engines where boost arrives after you have already committed to the throttle.",
+        "picker_description": "No brake grab right after you lift off the gas.",
+        "data_type": "bool",
+        "ui_type": "toggle",
+        "parent_key": "QOLLongitudinal",
+        "settings_tier": "advanced"
+      },
+      {
+        "key": "PedalReleaseGuardTime",
+        "label": "Pedal Hand-off Guard Time",
+        "description": "How long light braking is suppressed after you lift off the gas. The 0.15 s default suits instant-response drivetrains; a turbo engine that keeps pulling for a second or more after you lift needs a longer window. Requires Smooth Pedal Hand-off.",
+        "data_type": "float",
+        "ui_type": "numeric",
+        "min": 0.05,
+        "max": 2.0,
+        "parent_key": "QOLLongitudinal",
+        "settings_tier": "advanced"
+      },
+      {
+        "key": "AutoResumeFromStop",
+        "label": "Auto Resume From Stop",
+        "description": "Let openpilot pull away from a full standstill on its own, instead of waiting for you to press the gas pedal or Resume/+.\n\nThis car's port reports that it cannot launch itself, so this is experimental: validate standstill takeoff somewhere safe before relying on it. Requires openpilot longitudinal control, and the driving stack restarts when you change it.",
+        "picker_description": "openpilot launches from a stop without gas or Resume/+.",
+        "data_type": "bool",
+        "ui_type": "toggle",
+        "parent_key": "QOLLongitudinal",
+        "settings_tier": "advanced"
+      },
+      {
         "key": "RadarTakeoffs",
         "label": "Radar for Takeoffs",
         "description": "Turns on/off using radar data to track leads at standstill, making following/takeoffs more responsive once leads move.",

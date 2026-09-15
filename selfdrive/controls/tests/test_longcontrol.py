@@ -1617,3 +1617,51 @@ def test_leaving_experimental_does_not_reset_mode_transition_timer():
     lc.update_mpc_mode(False)
 
   assert not lc.transitioning
+
+
+def release_pedal_override(lc, toggles, a_target=-0.2):
+  """Hold a pedal override for one frame, release it, and return the accel after release."""
+  CS = car.CarState.new_message(vEgo=10.0, aEgo=0.0, brakePressed=False)
+  CS.cruiseState.standstill = False
+  common = {"active": True, "CS": CS, "should_stop": False,
+            "accel_limits": (-3.0, 2.0), "starpilot_toggles": toggles}
+  lc.update(a_target=a_target, pedal_override=True, **common)
+  return lc.update(a_target=a_target, pedal_override=False, **common)
+
+
+def count_guarded_frames(lc, toggles, a_target=-0.2, frame_limit=500):
+  """How many frames of light braking are suppressed after the pedal override is released."""
+  CS = car.CarState.new_message(vEgo=10.0, aEgo=0.0, brakePressed=False)
+  CS.cruiseState.standstill = False
+  common = {"active": True, "CS": CS, "should_stop": False,
+            "accel_limits": (-3.0, 2.0), "starpilot_toggles": toggles}
+  lc.update(a_target=a_target, pedal_override=True, **common)
+  for frame in range(frame_limit):
+    if lc.update(a_target=a_target, pedal_override=False, **common) != 0.0:
+      return frame
+  return frame_limit
+
+
+def test_pedal_release_guard_lasts_the_configured_time():
+  guarded = count_guarded_frames(LongControl(make_longcontrol_cp()),
+                                 make_toggles(pedal_release_guard_time=0.7))
+
+  assert guarded == round(0.7 / DT_CTRL)
+
+
+def test_pedal_release_guard_falls_back_to_default_time():
+  """An absent or zero toggle must not collapse the guard to a single frame."""
+  guarded = count_guarded_frames(LongControl(make_longcontrol_cp()), make_toggles())
+
+  assert guarded == round(longcontrol.PEDAL_RELEASE_GUARD_TIME_S / DT_CTRL)
+
+
+def test_pedal_release_guard_suppresses_light_decel_but_not_heavy():
+  """Light braking right after lift-off is dropped; real braking still gets through."""
+  toggles = make_toggles(pedal_release_guard_time=0.7)
+
+  light = LongControl(make_longcontrol_cp())
+  assert release_pedal_override(light, toggles, a_target=-0.2) == 0.0
+
+  heavy = LongControl(make_longcontrol_cp())
+  assert release_pedal_override(heavy, toggles, a_target=-2.0) < -longcontrol.PEDAL_RELEASE_GUARD_MAX_DECEL

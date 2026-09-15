@@ -562,8 +562,11 @@ class Controls:
     if not CC.latActive:
       self.LaC.reset()
       self.lane_centering.reset()
-    tesla_pedal_override = self.CP.brand == "tesla" and bool(CS.gasPressed)
-    if not CC.longActive and not tesla_pedal_override:
+    # Tesla-style pedal handling: keep the long controller warm through a gas override and
+    # guard the hand-off, instead of resetting and exposing whatever decel the plan wants.
+    pedal_override = bool(CS.gasPressed) and (self.CP.brand == "tesla" or
+                                              self.starpilot_toggles.pedal_release_guard)
+    if not CC.longActive and not pedal_override:
       self.LoC.reset()
 
     # accel PID loop
@@ -573,7 +576,7 @@ class Controls:
                                                 self.starpilot_toggles, has_lead=long_plan.hasLead,
                                                 traffic_mode_enabled=self.sm['starpilotCarState'].trafficModeEnabled,
                                                 profile_max_accel=self.sm['starpilotPlan'].maxAcceleration,
-                                                pedal_override=tesla_pedal_override,
+                                                pedal_override=pedal_override,
                                                 leads=(self.sm['radarState'].leadOne, self.sm['radarState'].leadTwo)),
                                 self.starpilot_toggles.max_desired_acceleration))
 

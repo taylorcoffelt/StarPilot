@@ -6345,6 +6345,20 @@ def setup(app):
           "updated": updated,
         }), 200
 
+      if key == "AutoResumeFromStop":
+        if params.get_bool("IsOnroad"):
+          return jsonify({"error": "Cannot change Auto Resume From Stop while driving."}), 403
+
+        enabled = str_val.strip() in ("1", "true", "True")
+        params.put_bool(key, enabled)
+        # autoResumeSng is read once when CarParams is built, so the stack has to cycle
+        params.put_bool("OnroadCycleRequested", True)
+        update_starpilot_toggles()
+        return jsonify({
+          "message": f"Parameter '{key}' updated successfully. The driving stack will restart shortly.",
+          "updated": {key: enabled},
+        }), 200
+
       if key == "AlphaLongitudinalEnabled":
         if not _get_alpha_longitudinal_available():
           return jsonify({"error": "Alpha Longitudinal is not available for the detected vehicle."}), 403
