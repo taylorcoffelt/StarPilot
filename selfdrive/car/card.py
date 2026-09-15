@@ -157,6 +157,13 @@ class Car:
       self.CI, self.CP, self.FPCP = CI, CI.CP, CI.FPCP
       self.RI = RI
 
+    # The port sets autoResumeSng False when the car will not pull away from a stop on its
+    # own. AutoResumeFromStop overrides that, but only with openpilot longitudinal: under
+    # stock ACC the flag would just suppress the correct "press Resume" prompt. Kept here
+    # rather than in vendored opendbc so upstream merges stay clean.
+    if self.CP.openpilotLongitudinalControl and get_starpilot_toggles().auto_resume_from_stop:
+      self.CP.autoResumeSng = True
+
     car_gps_supported = bool(getattr(self.CI.CS, 'car_gps_supported', False))
     self.params.put_bool("CarGpsAvailable", car_gps_supported)
     if car_gps_supported:
