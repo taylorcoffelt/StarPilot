@@ -2103,6 +2103,15 @@
         "settings_tier": "simple"
       },
       {
+        "key": "StarChartNavFeed",
+        "label": "Google Maps Navigation Feed",
+        "description": "Take turn-by-turn guidance and posted speed limits from a patched Google Maps app on your phone, over Wi-Fi.\n\nBoth devices must be on the same network, and the phone must be running the StarChart-patched Maps build — no Android Auto pairing is needed. Feeds the Navigation speed limit source and route speed control. Nothing is used while the link is down, so guidance clears rather than going stale.",
+        "picker_description": "Turn-by-turn and speed limits from Google Maps on your phone.",
+        "data_type": "bool",
+        "ui_type": "toggle",
+        "settings_tier": "simple"
+      },
+      {
         "key": "SpeedLimitController",
         "label": "Speed Limit Controller",
         "description": "Limit openpilot's maximum driving speed using configured map, dashboard, and optional vision sources. Press + above a limit for a persistent override; hold the gas pedal for a temporary override.",

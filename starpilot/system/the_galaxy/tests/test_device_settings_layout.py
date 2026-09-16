@@ -501,3 +501,30 @@ def test_pip_preview_is_under_driving_screen_widgets_and_configured_only_in_gala
     REPO_ROOT / "selfdrive/ui/layouts/settings/starpilot/appearance.py",
   )
   assert all("PIPPreview" not in path.read_text(encoding="utf-8") for path in physical_settings)
+
+
+def test_starchart_nav_feed_is_reachable_in_both_settings_uis():
+  setting = _params_by_section(_layout())["Longitudinal (Speed & Following)"]["StarChartNavFeed"]
+
+  assert setting["ui_type"] == "toggle"
+  assert setting["settings_tier"] == "simple"
+  assert "parent_key" not in setting
+  assert _declared_default("StarChartNavFeed") == "0"
+
+  # Tuning level 0, or the toggle is invisible on a device that never raised its level —
+  # which is every device out of the box.
+  params_source = PARAM_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"StarChartNavFeed", {PERSISTENT, BOOL, "0", "0", 0, SETTINGS_SIMPLE}}' in params_source
+
+  device_ui = (REPO_ROOT / "selfdrive/ui/layouts/settings/starpilot/longitudinal.py").read_text(encoding="utf-8")
+  assert 'SettingRow("StarChartNavFeed"' in device_ui
+
+
+def test_starchart_process_is_gated_on_its_toggle_and_on_being_installed():
+  process_config = (REPO_ROOT / "system/manager/process_config.py").read_text(encoding="utf-8")
+
+  assert 'params.get_bool("StarChartNavFeed") and os.path.exists(STARCHART_BINARY)' in process_config
+  # The bridge ships outside this tree, so a device without it must read as off rather
+  # than leave manager restarting a missing binary for the whole drive.
+  assert 'STARCHART_BINARY = os.path.join(STARCHART_DIR, "starchart")' in process_config
+  assert 'NativeProcess("starchart"' in process_config

@@ -15,6 +15,13 @@ WEBCAM = os.getenv("USE_WEBCAM") is not None
 UI_WATCHDOG_MAX_DT = int(os.getenv("UI_WATCHDOG_MAX_DT", "10"))
 CAMERAD_WATCHDOG_MAX_DT = int(os.getenv("CAMERAD_WATCHDOG_MAX_DT", "5"))
 
+# StarChart is a separate project: a static binary that bridges a patched Google Maps
+# client to NavInstructionState. It lives outside this tree and is deployed on its own,
+# so everything here is discovered at runtime rather than assumed to exist.
+STARCHART_DIR = "/data/starchart"
+STARCHART_BINARY = os.path.join(STARCHART_DIR, "starchart")
+STARCHART_CONFIG = "starchart-gmaps.toml"
+
 def driverview(started: bool, params: Params, CP: car.CarParams, starpilot_toggles: SimpleNamespace) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
 
@@ -129,6 +136,16 @@ def bluetooth_enabled(started: bool, params: Params, CP: car.CarParams, starpilo
   return params.get_bool("BluetoothEnabled")
 
 
+def starchart_nav_feed(started: bool, params: Params, CP: car.CarParams, starpilot_toggles: SimpleNamespace) -> bool:
+  # Deliberately not gated on `started`: the phone announces itself while the car is
+  # still parked, and having the link already up means the first guidance tick of a
+  # drive lands immediately instead of after a discovery round.
+  #
+  # The bridge is installed separately from this tree, so a device without it reads as
+  # off rather than leaving manager to restart a missing binary forever.
+  return params.get_bool("StarChartNavFeed") and os.path.exists(STARCHART_BINARY)
+
+
 def soundd_run(started: bool, params: Params, CP: car.CarParams, starpilot_toggles: SimpleNamespace) -> bool:
   return driverview(started, params, CP, starpilot_toggles) or params.get_bool("BluetoothAudioTestActive")
 
@@ -210,6 +227,8 @@ procs = [
 # StarPilot variables
 procs += [
   PythonProcess("bluetooth_managerd", "starpilot.system.bluetooth.daemon", bluetooth_enabled, enabled=TICI),
+  NativeProcess("starchart", STARCHART_DIR, ["./starchart", "--config", STARCHART_CONFIG], starchart_nav_feed,
+                enabled=TICI, nice=10),
   PythonProcess("wheel_controlsd", "starpilot.system.wheel_controls.wheel_controlsd", wheel_controls_enabled, enabled=TICI, nice=19),
   PythonProcess("the_galaxy", "starpilot.system.the_galaxy.the_galaxy", always_run, nice=10),
   PythonProcess("galaxy", "starpilot.system.galaxy.galaxy", always_run, nice=10),

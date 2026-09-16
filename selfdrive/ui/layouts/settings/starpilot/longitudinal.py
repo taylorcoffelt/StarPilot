@@ -524,6 +524,10 @@ class StarPilotLongitudinalLayout(_SettingsPage):
                  get_state=lambda: self._params.get_bool("NavLongitudinalAllowed"),
                  set_state=lambda s: self._params.put_bool("NavLongitudinalAllowed", s),
                  visible=self._longitudinal_enabled),
+      SettingRow("StarChartNavFeed", "toggle", tr_noop("Google Maps Navigation Feed"),
+                 subtitle=tr_noop("Take turn-by-turn guidance and posted speed limits from a patched Google Maps app on your phone, over Wi-Fi."),
+                 get_state=lambda: self._params.get_bool("StarChartNavFeed"),
+                 set_state=lambda s: self._params.put_bool("StarChartNavFeed", s)),
     ]
 
     # ── 2. Advanced Actuators Rows ──
