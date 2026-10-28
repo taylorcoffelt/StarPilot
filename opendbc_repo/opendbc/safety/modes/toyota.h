@@ -219,6 +219,12 @@ static void toyota_hold_observe(const CANPacket_t *msg) {
 }
 
 static void toyota_optional_rx_hook(const CANPacket_t *msg) {
+  // Only bus0 pedal RX belongs to the required catalog. A CRC-valid camera
+  // copy must neither invalidate its parent nor refresh the primary lease.
+  if (toyota_pedal && msg_matches(msg, 0x201U, 2U) && (GET_LEN(msg) == 6U) &&
+      (msg->data[5] == toyota_pedal_checksum(msg))) {
+    return;
+  }
   if (toyota_dsu_bypass) {
     if (msg_matches(msg, 0x343U, 2U)) {
       // A malformed packet outside the required catalog cannot retain LONG.
