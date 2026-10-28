@@ -24,8 +24,9 @@ from openpilot.starpilot.models.status import ModelVariant
 MAX_ANALYSIS_SECONDS = 30.0
 MAX_PAIR_SECONDS = 1.0
 MAX_SPEED_MPS = 70.0
+MAX_REVERSE_SPEED_MPS = 15.0
 MAX_ROUTE_COMPRESSED_BYTES = 256 * 1024 * 1024
-ANALYSIS_VERSION = 4
+ANALYSIS_VERSION = 5
 MAX_MODEL_METADATA_SECONDS = 4.0
 DISTRACTED_EVENT = 'driverDistracted2'
 UNRESPONSIVE_EVENT = 'driverUnresponsive3'
@@ -345,11 +346,12 @@ def analyze_route(root: Path, route: dict, *, permitted: Callable[[], bool], pre
           model_outputs.append((stamp, bool(getattr(event, kind).big)))
         elif kind == 'carState':
           speed = float(event.carState.vEgo)
-          if not math.isfinite(speed) or not -.5 <= speed <= MAX_SPEED_MPS or (last_car is not None and stamp <= last_car):
+          if not math.isfinite(speed) or not -MAX_REVERSE_SPEED_MPS <= speed <= MAX_SPEED_MPS or \
+             (last_car is not None and stamp <= last_car):
             coverage_gap = True
             previous_car = None
             continue
-          speed = max(0.0, speed)
+          speed = abs(speed)
           if previous_car is not None:
             delta = (stamp - previous_car[0]) / 1e9
             if delta > MAX_PAIR_SECONDS:

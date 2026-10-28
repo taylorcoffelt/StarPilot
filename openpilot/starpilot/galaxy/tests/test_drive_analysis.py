@@ -103,6 +103,20 @@ class DriveAnalysisTest(unittest.TestCase):
     self.assertIsNone(result['aolSeconds'])
     self.assertIsNone(result['aolPercent'])
 
+  def test_reverse_speed_is_driven_distance_not_a_gap(self):
+    events = [*self.sample(BASE, -2, False), *self.sample(BASE + 500_000_000, -2, False),
+              *self.sample(BASE + 1_000_000_000, 10, False), event('sentinel', BASE + 1_000_000_000, type='endOfRoute')]
+    result = analyze_route(self.root, selection(write(self.root, 0, events)), permitted=lambda: True)
+    self.assertTrue(result['complete'], result)
+    self.assertEqual(result['distanceMeters'], 4)
+
+  def test_implausible_reverse_speed_is_incomplete(self):
+    events = [*self.sample(BASE, -(drive_analysis.MAX_REVERSE_SPEED_MPS + 1), False),
+              *self.sample(BASE + 500_000_000, 5, False), event('sentinel', BASE + 500_000_000, type='endOfRoute')]
+    result = analyze_route(self.root, selection(write(self.root, 0, events)), permitted=lambda: True)
+    self.assertFalse(result['complete'])
+    self.assertIn('missing or gapped', result['reason'])
+
   def test_missing_sentinel_gap_and_noncontiguous_segments_are_incomplete(self):
     events = [*self.sample(BASE, 5, True), *self.sample(BASE + 2_000_000_000, 5, True)]
     route = selection(write(self.root, 0, events))
