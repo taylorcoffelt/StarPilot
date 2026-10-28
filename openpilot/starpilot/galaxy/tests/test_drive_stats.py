@@ -52,10 +52,11 @@ class DriveStatsTest(unittest.TestCase):
     self.now = [NOW]
     self.owners = []
 
-  def owner(self, analyzer=analyzed, permitted=lambda: True, monotonic=None, metric=None):
+  def owner(self, analyzer=analyzed, permitted=lambda: True, monotonic=None, metric=None, clock_valid=lambda: True):
     owner = DriveStatsOwner(root=self.root, store=self.store, history=Mock(wraps=self.history),
                             analyzer=analyzer, permitted=permitted, clock=lambda: self.now[0],
-                            monotonic=monotonic if monotonic is not None else lambda: self.now[0], metric=metric)
+                            monotonic=monotonic if monotonic is not None else lambda: self.now[0], metric=metric,
+                            clock_valid=clock_valid)
     self.owners.append(owner)
     self.addCleanup(owner.close)
     return owner
@@ -456,6 +457,36 @@ class DriveStatsTest(unittest.TestCase):
       owner._start()
       owner.snapshot()
       recovered = self.completed(owner, scans=3)
+    owner.analyzer.assert_called_once()
+    self.assertEqual(recovered['analysis']['failed'], 0)
+    self.assertEqual(recovered['totals']['drives'], 1)
+
+  def test_analysis_waits_for_a_valid_wall_clock(self):
+    clock_valid = [False]
+    owner = self.owner(analyzer=mock.Mock(wraps=analyzed), clock_valid=lambda: clock_valid[0])
+    owner._run()
+    owner.analyzer.assert_not_called()
+    self.assertEqual(owner._failures, {})
+    clock_valid[0] = True
+    self.now[0] += 1
+    owner._start()
+    owner.snapshot()
+    self.assertEqual(self.completed(owner)['totals']['drives'], 1)
+
+  def test_failure_stamped_by_an_unsynced_clock_is_retried(self):
+    owner = self.owner(analyzer=lambda *args, **kwargs: {**analyzed(*args, **kwargs),
+                                                       'complete': False, 'reason': 'Route has no logged or named wall time'})
+    owner._start()
+    owner.snapshot()
+    self.completed(owner)
+    unsynced = datetime(2024, 7, 28, tzinfo=UTC).timestamp()
+    owner._failures['abc'].update(firstAt=unsynced, retryAt=unsynced + drive_stats.RETRY_SECONDS)
+    owner._save()
+    self.now[0] += 61
+    owner = self.owner(analyzer=mock.Mock(wraps=analyzed))
+    owner._start()
+    owner.snapshot()
+    recovered = self.completed(owner)
     owner.analyzer.assert_called_once()
     self.assertEqual(recovered['analysis']['failed'], 0)
     self.assertEqual(recovered['totals']['drives'], 1)
