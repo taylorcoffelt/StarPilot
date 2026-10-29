@@ -343,14 +343,10 @@ class TransportPauseFeedback:
     return native
 
   def _native_long_withdrawal_lateral_current(self, sm, cp, cs, axis, now_ns, *, latched, producer):
-    """Retain existing LAT intent from a fresh independently granted LAT proof.
-
-    Requested but denied LONG is never an active combined-axis baseline. This
-    method neither grants outputs nor exempts any native or control fault.
-    """
+    """Retain LAT intent from a fresh native LAT grant; never grant LONG or bypass faults."""
     from openpilot.starpilot.nostalgia import physical_cancel
     from openpilot.starpilot.car.gm.aol import native_accepts_cp
-    from openpilot.starpilot.car.hyundai.aol import early_native_long_withdrawal_supported
+    from openpilot.starpilot.car.hyundai.aol import early_native_long_withdrawal_supported, classic_brake_withdrawal
     gm = cp.brand == 'gm' and native_accepts_cp(cp, int(cp.safetyConfigs[0].safetyModel.raw), int(cp.safetyConfigs[0].safetyParam))
     from openpilot.starpilot.car.hyundai.aol import qualified_ccnc_long_aol as ev9_qualified
     from opendbc.car import structs
@@ -394,7 +390,7 @@ class TransportPauseFeedback:
         now_ns - int(sm.logMonoTime['onroadEvents']) > 1_500_000_000 or
         any(event.immediateDisable or event.softDisable or
             event.userDisable and not (ev9_main_off and event.name == log.OnroadEvent.EventName.wrongCarMode or
-              gm_pedal and event.name == log.OnroadEvent.EventName.pedalPressed or
+              (gm_pedal or classic_brake_withdrawal(cp, cs)) and event.name == log.OnroadEvent.EventName.pedalPressed or
               ford_withdrawal and event.name in (log.OnroadEvent.EventName.pedalPressed, log.OnroadEvent.EventName.pcmDisable,
                 log.OnroadEvent.EventName.buttonCancel))
             for event in sm['onroadEvents'])):
