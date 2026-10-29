@@ -165,7 +165,7 @@ export function modelActionAllowed(data, action, model = null) {
   if (data.isOnroad !== false && !["favorite", "unfavorite", "cancel"].includes(action)) return false
   if (action === "jetlink") return data.jetlink !== undefined
   if (["select-small", "select-big"].includes(action)) {
-    if (data.downloading || data.randomizer === true) return false
+    if (data.downloading && data.refreshing !== true || data.randomizer === true) return false
     if (action === "select-big" && model === null) return true
     return model?.installed === true && model.selectable === true && fitsModelProfile(model, action === "select-big" ? "big" : "small")
   }
@@ -389,6 +389,12 @@ export const ModelsPage = {
     this.manager.stop()
   },
   methods: {
+    isPolaris(model) { return ["spz_polaris_r3a", "spz_polaris_r3b"].includes(model?.value) },
+    polarisTitleParts(model) {
+      const label = model.label || model.value
+      const emoji = label.search(/\p{Extended_Pictographic}/u)
+      return emoji < 0 ? [label, ""] : [label.slice(0, emoji), label.slice(emoji)]
+    },
     hardwareLabel, fileSizeText,
     setHardwareFilter(value) { this.hardwareFilter = saveHardwareFilter(value) },
     toggleHardware(kind, checked) {
@@ -569,10 +575,11 @@ export const ModelsPage = {
         </template>
         <template v-else>
           <div class="gx-card-grid">
-            <section class="gx-card gx-model-card" v-for="m in sorted" :key="m.value">
+            <section class="gx-card gx-model-card" :class="{'gx-model-card--polaris': isPolaris(m)}" v-for="m in sorted" :key="m.value">
               <div class="gx-panel">
                 <div class="gx-model-card__heading">
-                  <strong>{{ m.label || m.value }}</strong>
+                  <strong v-if="isPolaris(m)"><span class="gx-model-card__title">{{ polarisTitleParts(m)[0] }}</span><span>{{ polarisTitleParts(m)[1] }}</span></strong>
+                  <strong v-else>{{ m.label || m.value }}</strong>
                   <div class="gx-model-card__actions">
                     <button v-if="rowState(m) === 'available' && m.downloadAvailable" type="button" class="gx-icon-btn" :disabled="!actionAvailable('download', m)" :aria-label="'Download ' + m.label" :title="'Download ' + m.label" @click="runAction('download', m)"><i class="bi bi-download" aria-hidden="true"></i></button>
                     <button type="button" class="gx-icon-btn" :disabled="!actionAvailable(m.userFavorite ? 'unfavorite' : 'favorite', m)" :aria-label="(m.userFavorite ? 'Remove from your favorites: ' : 'Add to your favorites: ') + m.label" :title="m.userFavorite ? 'Remove from your favorites' : 'Add to your favorites'" @click="runAction(m.userFavorite ? 'unfavorite' : 'favorite', m)">
@@ -581,6 +588,7 @@ export const ModelsPage = {
                   </div>
                 </div>
                 <div class="gx-actions gx-tags">
+                  <span v-if="isPolaris(m)" class="gx-chip gx-polaris-badge"><span class="gx-polaris-badge__star" aria-hidden="true">✦</span> StarPilot Custom</span>
                   <span v-if="m.communityFavorite" class="gx-chip">Community Favorite</span>
                   <span v-if="rowState(m) === 'active'" class="gx-chip gx-chip--selected">Selected</span>
                   <span class="gx-chip">{{ m.value }}</span>
