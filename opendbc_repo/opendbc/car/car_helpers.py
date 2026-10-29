@@ -16,6 +16,7 @@ from opendbc.car.ford.discovery import (normal_bus0_selection as ford_normal_bus
 from opendbc.car.hyundai.discovery import normal_bus_topology
 from opendbc.car.values import BRANDS
 from opendbc.car.vin import get_vin, is_valid_vin, VIN_UNKNOWN
+from opendbc.car.vin_identity import identify_by_vin
 
 FRAME_FINGERPRINT = 100  # 1s
 
@@ -204,6 +205,9 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
   # Refine after both automatic sources, before the explicit override below.
   if not fixed_fingerprint:
     car_fingerprint = automatic_bolt_candidate(car_fingerprint, finger, camera_cruise_messages, vin)
+    vin_candidate = None if car_fingerprint else identify_by_vin(vin, fw_candidates=fw_candidates, can_layout=finger)
+    if vin_candidate is not None:
+      car_fingerprint, exact_match = vin_candidate, False
 
   if fixed_fingerprint:
     car_fingerprint = fixed_fingerprint

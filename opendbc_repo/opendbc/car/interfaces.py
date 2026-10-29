@@ -376,6 +376,7 @@ class CarControllerBase(ABC):
 INTERFACE_ATTR_FILE = {
   "FINGERPRINTS": "fingerprints",
   "FW_VERSIONS": "fingerprints",
+  "VIN_PATTERNS": "vin_patterns",
 }
 
 # interface-specific helpers
