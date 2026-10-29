@@ -8,10 +8,10 @@ from opendbc.car.car_helpers import fingerprint
 from opendbc.car.fingerprints import _FINGERPRINTS as FINGERPRINTS
 from opendbc.car.values import PLATFORMS
 from opendbc.car.vin import Vin
-from opendbc.car.vin_identity import MODEL_YEAR_CODES, VinPattern, identify_by_vin, model_year_codes, registered_patterns
+from opendbc.car.vin_identity import MODEL_YEAR_CODES, VinPattern, codes_for_model_years, identify_by_vin, registered_patterns
 
-ALPHA = VinPattern(wmis=frozenset({"AAA"}), descriptor="1B", model_year_codes=model_year_codes(2024, 2025))
-BETA = VinPattern(wmis=frozenset({"BBB"}), descriptor="2C", model_year_codes=model_year_codes(2024, 2025))
+ALPHA = VinPattern(wmis=frozenset({"AAA"}), descriptor_prefix="1B", model_year_codes=codes_for_model_years(first_year=2024, last_year=2025))
+BETA = VinPattern(wmis=frozenset({"BBB"}), descriptor_prefix="2C", model_year_codes=codes_for_model_years(first_year=2024, last_year=2025))
 ALPHA_VIN = "AAA1BXXXXRX000000"
 PATTERNS = {"ALPHA": (ALPHA,), "BETA": (BETA,)}
 NO_CAN: dict[int, dict[int, int]] = {}
@@ -27,11 +27,15 @@ class TestModelYearCodes(unittest.TestCase):
     expected = {2010: "A", 2017: "H", 2018: "J", 2024: "R", 2025: "S", 2026: "T", 2031: "1", 2039: "9"}
     for year, code in expected.items():
       with self.subTest(year=year):
-        self.assertEqual(model_year_codes(year, year), {code})
+        self.assertEqual(codes_for_model_years(first_year=year, last_year=year), {code})
+
+  def test_ranges_include_both_bounds(self):
+    self.assertEqual(codes_for_model_years(first_year=2024, last_year=2026), {"R", "S", "T"})
 
   def test_codes_never_use_letters_reserved_by_the_vin_standard(self):
-    self.assertFalse(set("IOQUZ") & model_year_codes(2010, 2039))
-    self.assertEqual(len(model_year_codes(2010, 2039)), len(MODEL_YEAR_CODES))
+    full_cycle = codes_for_model_years(first_year=2010, last_year=2039)
+    self.assertFalse(set("IOQUZ") & full_cycle)
+    self.assertEqual(len(full_cycle), len(MODEL_YEAR_CODES))
 
 
 class TestVinPattern(unittest.TestCase):
@@ -45,7 +49,7 @@ class TestVinPattern(unittest.TestCase):
 
 
 class TestIdentifyByVin(unittest.TestCase):
-  def identify(self, vin, fw_candidates=frozenset(), can_layout=NO_CAN, patterns=PATTERNS):
+  def identify(self, vin, *, fw_candidates=frozenset(), can_layout=NO_CAN, patterns=PATTERNS):
     return identify_by_vin(vin, fw_candidates=fw_candidates, can_layout=can_layout, patterns=patterns)
 
   def test_unique_match_without_firmware_identifies_the_platform(self):
@@ -92,15 +96,19 @@ def discovery_without_firmware(vin):
     yield
 
 
+def fingerprint_without_bus_traffic():
+  return fingerprint(lambda **_: [], lambda _: None, lambda _: None, None)
+
+
 class TestFingerprintVinFallback(unittest.TestCase):
   def test_vin_identity_is_reported_as_inexact(self):
     with discovery_without_firmware(ALPHA_VIN):
-      candidate, _, vin, _, _, exact_match = fingerprint(lambda **_: [], lambda _: None, lambda _: None, None)
+      candidate, _, vin, _, _, exact_match = fingerprint_without_bus_traffic()
     self.assertEqual((candidate, vin, exact_match), ("ALPHA", ALPHA_VIN, False))
 
   def test_explicit_fingerprint_overrides_the_vin(self):
     with patch.dict('os.environ', {'FINGERPRINT': "BETA"}), discovery_without_firmware(ALPHA_VIN):
-      candidate, *_ = fingerprint(lambda **_: [], lambda _: None, lambda _: None, None)
+      candidate, *_ = fingerprint_without_bus_traffic()
     self.assertEqual(candidate, "BETA")
 
 
@@ -122,7 +130,7 @@ class TestRegisteredPatterns(unittest.TestCase):
         for pattern in patterns:
           self.assertTrue(pattern.wmis)
           self.assertTrue(all(len(wmi) == 3 for wmi in pattern.wmis))
-          self.assertTrue(0 < len(pattern.descriptor) <= 6)
+          self.assertTrue(0 < len(pattern.descriptor_prefix) <= 6)
           self.assertTrue(pattern.model_year_codes)
           self.assertLessEqual(pattern.model_year_codes, set(MODEL_YEAR_CODES))
 

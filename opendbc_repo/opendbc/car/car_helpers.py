@@ -206,7 +206,7 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
   # Refine after both automatic sources, before the explicit override below.
   if not fixed_fingerprint:
     car_fingerprint = automatic_bolt_candidate(car_fingerprint, finger, camera_cruise_messages, vin)
-    vin_candidate = None if car_fingerprint else identify_by_vin(vin, fw_candidates=fw_candidates, can_layout=finger)
+    vin_candidate = identify_by_vin(vin, fw_candidates=fw_candidates, can_layout=finger) if car_fingerprint is None else None
     if vin_candidate is not None:
       car_fingerprint, exact_match = vin_candidate, False
 
