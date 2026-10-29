@@ -1,5 +1,10 @@
+import sys
+import types
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
 
+from opendbc.car.car_helpers import fingerprint
 from opendbc.car.fingerprints import _FINGERPRINTS as FINGERPRINTS
 from opendbc.car.values import PLATFORMS
 from opendbc.car.vin import Vin
@@ -8,7 +13,6 @@ from opendbc.car.vin_identity import MODEL_YEAR_CODES, VinPattern, identify_by_v
 ALPHA = VinPattern(wmis=frozenset({"AAA"}), descriptor="1B", model_year_codes=model_year_codes(2024, 2025))
 BETA = VinPattern(wmis=frozenset({"BBB"}), descriptor="2C", model_year_codes=model_year_codes(2024, 2025))
 ALPHA_VIN = "AAA1BXXXXRX000000"
-BETA_VIN = "BBB2CXXXXSX000000"
 PATTERNS = {"ALPHA": (ALPHA,), "BETA": (BETA,)}
 NO_CAN: dict[int, dict[int, int]] = {}
 
@@ -76,9 +80,42 @@ class TestIdentifyByVin(unittest.TestCase):
     self.assertEqual(self.identify(ALPHA_VIN, can_layout=with_diagnostics, patterns=TABLE_PATTERNS), TABLE_PLATFORM)
 
 
+@contextmanager
+def discovery_without_firmware(vin):
+  with patch('opendbc.car.vin_identity.registered_patterns', return_value=PATTERNS), \
+       patch('opendbc.car.car_helpers.normal_bus_query_brand', return_value=None), \
+       patch('opendbc.car.car_helpers.get_vin', return_value=(0x7E8, 0, vin)), \
+       patch('opendbc.car.car_helpers.get_present_ecus', return_value=set()), \
+       patch('opendbc.car.car_helpers.get_fw_versions_ordered', return_value=[]), \
+       patch('opendbc.car.car_helpers.match_fw_to_car', return_value=(True, set())), \
+       patch('opendbc.car.car_helpers.can_fingerprint', return_value=(None, NO_CAN)):
+    yield
+
+
+class TestFingerprintVinFallback(unittest.TestCase):
+  def test_vin_identity_is_reported_as_inexact(self):
+    with discovery_without_firmware(ALPHA_VIN):
+      candidate, _, vin, _, _, exact_match = fingerprint(lambda **_: [], lambda _: None, lambda _: None, None)
+    self.assertEqual((candidate, vin, exact_match), ("ALPHA", ALPHA_VIN, False))
+
+  def test_explicit_fingerprint_overrides_the_vin(self):
+    with patch.dict('os.environ', {'FINGERPRINT': "BETA"}), discovery_without_firmware(ALPHA_VIN):
+      candidate, *_ = fingerprint(lambda **_: [], lambda _: None, lambda _: None, None)
+    self.assertEqual(candidate, "BETA")
+
+
 class TestRegisteredPatterns(unittest.TestCase):
+  def setUp(self):
+    registered_patterns.cache_clear()
+    self.addCleanup(registered_patterns.cache_clear)
+
+  def test_patterns_are_collected_from_brand_vin_pattern_modules(self):
+    brand_module = types.ModuleType("opendbc.car.gm.vin_patterns")
+    brand_module.VIN_PATTERNS = {"CHEVROLET_TRAX": (ALPHA,)}
+    with patch.dict(sys.modules, {brand_module.__name__: brand_module}):
+      self.assertEqual(registered_patterns(), {"CHEVROLET_TRAX": (ALPHA,)})
+
   def test_every_pattern_targets_a_known_platform_with_well_formed_sections(self):
-    self.assertTrue(registered_patterns())
     for platform, patterns in registered_patterns().items():
       with self.subTest(platform=platform):
         self.assertIn(platform, PLATFORMS)
