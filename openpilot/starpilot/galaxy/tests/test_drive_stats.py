@@ -52,11 +52,12 @@ class DriveStatsTest(unittest.TestCase):
     self.now = [NOW]
     self.owners = []
 
-  def owner(self, analyzer=analyzed, permitted=lambda: True, monotonic=None, metric=None, clock_valid=lambda: True):
+  def owner(self, analyzer=analyzed, permitted=lambda: True, monotonic=None, metric=None, clock_valid=lambda: True,
+            earliest_valid_stamp=None):
     owner = DriveStatsOwner(root=self.root, store=self.store, history=Mock(wraps=self.history),
                             analyzer=analyzer, permitted=permitted, clock=lambda: self.now[0],
                             monotonic=monotonic if monotonic is not None else lambda: self.now[0], metric=metric,
-                            clock_valid=clock_valid)
+                            clock_valid=clock_valid, earliest_valid_stamp=earliest_valid_stamp)
     self.owners.append(owner)
     self.addCleanup(owner.close)
     return owner
@@ -479,17 +480,31 @@ class DriveStatsTest(unittest.TestCase):
     owner._start()
     owner.snapshot()
     self.completed(owner)
-    unsynced = datetime(2024, 7, 28, tzinfo=UTC).timestamp()
+    unsynced = datetime(2026, 7, 28, tzinfo=UTC).timestamp()
     owner._failures['abc'].update(firstAt=unsynced, retryAt=unsynced + drive_stats.RETRY_SECONDS)
     owner._save()
     self.now[0] += 61
-    owner = self.owner(analyzer=mock.Mock(wraps=analyzed))
+    build_floor = datetime(2026, 7, 29, tzinfo=UTC).timestamp()
+    owner = self.owner(analyzer=mock.Mock(wraps=analyzed), earliest_valid_stamp=lambda: build_floor)
     owner._start()
     owner.snapshot()
     recovered = self.completed(owner)
     owner.analyzer.assert_called_once()
     self.assertEqual(recovered['analysis']['failed'], 0)
     self.assertEqual(recovered['totals']['drives'], 1)
+
+  def test_injected_clock_failures_ignore_the_host_build_floor(self):
+    owner = self.owner(analyzer=lambda *args, **kwargs: {**analyzed(*args, **kwargs), 'complete': False, 'reason': 'gap'})
+    with mock.patch.object(drive_stats, 'min_date', return_value=datetime(2099, 1, 1)):
+      owner._start()
+      owner.snapshot()
+      self.completed(owner)
+      self.now[0] += 61
+      owner._start()
+      owner.snapshot()
+      result = self.completed(owner, scans=2)
+    self.assertEqual(result['analysis']['state'], 'retrying')
+    self.assertEqual(owner._failures['abc']['attempts'], 1)
 
   def test_legacy_failure_gets_fresh_bounded_attempts(self):
     owner = self.owner(analyzer=lambda *args, **kwargs: {**analyzed(*args, **kwargs),

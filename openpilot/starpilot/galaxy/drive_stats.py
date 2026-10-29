@@ -159,7 +159,8 @@ class DriveStatsOwner:
   def __init__(self, root: Path | None = None, store: Path | None = None, history: DriveHistory | None = None,
                analyzer: Callable | None = None, permitted: Callable[[], bool] | None = None,
                clock: Callable[[], float] | None = None, monotonic: Callable[[], float] | None = None,
-               metric: Callable[[], bool] | None = None, clock_valid: Callable[[], bool] | None = None):
+               metric: Callable[[], bool] | None = None, clock_valid: Callable[[], bool] | None = None,
+               earliest_valid_stamp: Callable[[], float] | None = None):
     self.root = Path(root) if root is not None else None
     self.store = Path(store) if store is not None else galaxy_storage_root() / 'drive-stats.json'
     self.history = history if history is not None else DriveHistory(self.root, max_segments_per_route=MAX_STATS_SEGMENTS_PER_ROUTE,
@@ -174,6 +175,13 @@ class DriveStatsOwner:
     self.monotonic = monotonic if monotonic is not None else time.monotonic
     self.metric = metric if metric is not None else lambda: True
     self.clock_valid = clock_valid if clock_valid is not None else system_time_valid
+    # A floor is only comparable with stamps from the same clock.
+    if earliest_valid_stamp is not None:
+      self.earliest_valid_stamp = earliest_valid_stamp
+    elif clock is None:
+      self.earliest_valid_stamp = lambda: min_date().timestamp()
+    else:
+      self.earliest_valid_stamp = lambda: float('-inf')
     self._lock = threading.RLock()
     self._permit_lock = threading.Lock()
     self._permit_checked_at = float('-inf')
@@ -282,7 +290,7 @@ class DriveStatsOwner:
         self._scan_incomplete = inventory.get('scanIncomplete') is True or len(routes) > MAX_SCAN_ROUTES
         self._pending = 0
         route_ids = {route.get('routeId') for route in routes if isinstance(route, dict) and type(route.get('routeId')) is str}
-        earliest_valid_stamp = min_date().timestamp()
+        earliest_valid_stamp = self.earliest_valid_stamp()
         self._failures = {key: value for key, value in self._failures.items()
                           if key in route_ids and value['firstAt'] >= earliest_valid_stamp}
       candidates = []
