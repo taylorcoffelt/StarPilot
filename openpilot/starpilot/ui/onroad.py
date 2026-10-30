@@ -84,9 +84,10 @@ def clock_text(now: datetime | None = None, use_24_hour: bool = False) -> str:
 
 def axis_status_color(state: OnroadState) -> rl.Color:
   """Retain StarPilot's existing off, AOL, long-only, and combined edge colors."""
+  lateral = state.lateral_active if state.aol_latched is None else state.aol_latched
   if state.driver_override_active or state.longitudinal_overridden:
     return rl.Color(145, 155, 149, 255)
-  if state.lateral_active and state.switchback_mode:
+  if lateral and state.switchback_mode:
     return rl.Color(139, 108, 197, 255)
   if stop_active(state):
     return rl.Color(218, 111, 37, 255)
@@ -97,12 +98,12 @@ def axis_status_color(state: OnroadState) -> rl.Color:
     return rl.Color(255, 214, 0, 255)
   if mode is not None and mode.effective_experimental:
     return rl.Color(218, 111, 37, 255)
-  if state.lateral_active and state.longitudinal_active:
+  if lateral and state.longitudinal_active:
     if state.experimental_enabled and state.conditional_configured in (None, ModeChoice.STOCK):
       return rl.Color(218, 111, 37, 255)
     return rl.Color(22, 127, 64, 255)
-  if state.lateral_active:
-    return rl.Color(10, 186, 181, 255)
+  if lateral:
+    return rl.Color(22, 127, 64, 255) if state.stock_cruise_active else rl.Color(10, 186, 181, 255)
   if state.longitudinal_active:
     return rl.Color(255, 105, 180, 255)
   return rl.Color(18, 40, 57, 255)
@@ -123,6 +124,7 @@ class OnroadView:
     self.projection_viewport = projection_viewport
     self.wall_clock = wall_clock or (lambda: datetime.now().astimezone())
     self._corner_cache = CornerHintCache()
+    self.quick_select_layer = None
     gui_app.add_render_prepare(self._corner_cache.prepare, self._corner_cache.close)
     self.fonts = fonts
     self.camera_layer = camera_layer
@@ -430,6 +432,8 @@ class OnroadView:
           exit_layer(state)
       if not ordered and manual_slc_confirmation(self.fonts.profile, state):
         self._slc_actions(state)
+      if not self.projection_viewport and (quick_select := getattr(self, 'quick_select_layer', None)) is not None:
+        quick_select(content, state)
       self.alert.render(content, state.alert)
     finally:
       clip.end_scissor_mode()
@@ -437,7 +441,7 @@ class OnroadView:
       render_live_sidebar(self.fonts, rl.Rectangle(width, 0, SIDEBAR_WIDTH, height), state.developer_metrics)
     # Projection has its own permanent escape control in this corner; the native
     # favorite-menu hint would overlap it and does not control projected input.
-    if not self.projection_viewport and state.alert.size != AlertSize.FULL:
+    if not self.projection_viewport and not state.quick_select_open and state.alert.size == AlertSize.NONE:
       render_corner_hint(content, cache=self._corner_cache)
     label = status_label(state)
     if label is not None:
@@ -475,7 +479,7 @@ class OnroadView:
       self._stock_confidence_last_source_ns = None
     color = axis_status_color(state)
     if state.alert.size != AlertSize.NONE and (
-        not state.driver_override_active or state.alert.critical or state.alert.size == AlertSize.FULL):
+        not (state.driver_override_active or state.aol_latched) or state.alert.critical or state.alert.size == AlertSize.FULL):
       color = rl.Color(18, 40, 57, 255)
     rl.draw_rectangle(0, 0, 536, 240, rl.BLACK)
     clip.begin_scissor_mode(0, 0, 476, 240)
@@ -566,6 +570,7 @@ class OnroadView:
       self.fonts.draw(text, role, size, x, y, tint)
 
   def close(self) -> None:
+    self.quick_select_layer = None
     gui_app.remove_render_prepare(self._corner_cache.prepare)
     self._corner_cache.close()
     gui_app.remove_render_prepare(self.torque_bar.prepare)

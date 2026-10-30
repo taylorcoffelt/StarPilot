@@ -477,6 +477,51 @@ class TestSingleBoundary(unittest.TestCase):
 
 
 class TestSingleLineTracking(unittest.TestCase):
+  def test_two_line_guard_rejects_auxiliary_path_bias_when_command_is_centered(self):
+    for direction in (-1., 1.):
+      m = model(left=-1.8, right=1.8, path=direction * .5)
+      controller = LaneCenteringController()
+      source = observation(m, base_curvature=0., measured_curvature=0., lateral_delay_s=.1)
+      result = controller.update(source)
+      self.assertGreater(-direction * result.correction, 0.)
+      assert result.candidate_curvature is not None
+      self.assertEqual(controller.guard_applied(m, 0., result.candidate_curvature, 0., 20., .1), 0.)
+      self.assertEqual(controller._correction, 0.)
+
+  def test_two_line_tracking_interpolates_shared_coordinates_and_bounds_offset(self):
+    m = model(left=-1.31, right=1.31)
+    m.laneLines[2].x = [float(x) + .25 for x in XS]
+    controller = LaneCenteringController()
+    source = observation(m, base_curvature=0., settings=LaneCenteringSettings(True, .3, 0., True),
+                         measured_curvature=0., lateral_delay_s=.1)
+    controller.update(source)
+    path = controller._tracker.path
+    assert path is not None
+    self.assertEqual(path[0][0], 1.)
+    np.testing.assert_allclose(path[1], 0., atol=1e-6)
+    with patch('openpilot.starpilot.lateral.lane_centering.limit_tracking', return_value=0.) as guard:
+      self.assertEqual(controller.guard_applied(m, 0., .002, 0., 20., .1), 0.)
+    np.testing.assert_allclose(guard.call_args.args[0][1], .21, atol=1e-6)
+
+  def test_tracking_guard_has_continuous_small_corrections_near_the_objective(self):
+    from openpilot.starpilot.lateral.lane_clearance import _center_motion, limit_tracking
+    for sign in (1., -1.):
+      previous = 0.
+      for step in range(1, 51):
+        target = sign * step * 1e-6
+        x, y, _ = _center_motion(target, 0., 20., .1)
+        path = np.r_[0., x, 50.], np.r_[0., y, y[-1]]
+        allowed = limit_tracking(path, 0., sign * .0012, 0., 20., .1)
+        self.assertGreater(sign * allowed, 0.)
+        self.assertLess(abs(allowed - previous), 2e-6)
+        bx, by, _ = _center_motion(0., 0., 20., .1)
+        cx, cy, _ = _center_motion(allowed, 0., 20., .1)
+        selected = bx >= 2.
+        self.assertLess(np.mean((cy[selected] - np.interp(cx[selected], *path)) ** 2),
+                        np.mean((by[selected] - np.interp(bx[selected], *path)) ** 2))
+        previous = allowed
+      self.assertEqual(limit_tracking(path, 0., -sign * .0012, 0., 20., .1), 0.)
+
   def test_two_distinct_frames_confirm_line_without_learning_model_drift(self):
     from openpilot.starpilot.lateral.lane_tracking import SingleLineTracker
     tracker = SingleLineTracker()

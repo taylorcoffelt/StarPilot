@@ -73,9 +73,13 @@ class SavedSlcLifecycle:
       return self.runtime, False
     previous_runtime = self.runtime
     if (self.runtime is not None and self.configuration is not None and
-        configuration[:-1] == (self.configuration[0], replace(self.runtime.settings, offsets=settings.offsets),
+        configuration[:-1] == (self.configuration[0], replace(self.runtime.settings, offsets=settings.offsets,
+                                                               advance_seconds=settings.advance_seconds),
                                *self.configuration[2:-1])):
-      self.runtime.update_offsets(settings.offsets, is_metric=configuration[5])
+      if settings.offsets != self.runtime.settings.offsets or configuration[5] != self.configuration[5]:
+        self.runtime.update_offsets(settings.offsets, is_metric=configuration[5])
+      if settings.advance_seconds != self.runtime.settings.advance_seconds:
+        self.runtime.update_advance(settings.advance_seconds)
     else:
       set_speed_after_ns = self.runtime.set_speed_after_ns if self.runtime is not None else 0
       if self.runtime is not None:
@@ -231,6 +235,12 @@ def apply_conditional_stop_hold(host, planner, sm, CP, now_ns: int, drive_id: in
   if (now_ns - sm.logMonoTime['modelV2'] > 150_000_000 or
       now_ns - int(sm.recv_time['modelV2'] * 1e9) > 150_000_000):
     return unavailable()
+  stop_plan = getattr(planner, 'force_stop_plan', None)
+  if (stop_plan is not None and stop_plan.resume_override and stop_plan.model_ns == sm.logMonoTime['modelV2'] and
+      not stop_plan.forcing and not stop_plan.should_stop and abs(vehicle.vEgo) < 2.0 and planner.allow_throttle and
+      not any(lead.present for lead in (sm['radarState'].leadOne, sm['radarState'].leadTwo))):
+    host.mode.projector.stop_detector.reset()
+    return False
   from openpilot.starpilot.car.ford.stop_release import owner_for
   owner = getattr(host, 'ford_stopped_lead_release', None)
   if owner is None:

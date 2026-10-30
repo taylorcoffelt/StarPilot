@@ -317,6 +317,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"HidePersonalityAlerts", {PERSISTENT, BOOL, "0"}},
     {"ShowSpeedLimits", {PERSISTENT, BOOL, "1"}},
     {"SLCConfirmation", {PERSISTENT, BOOL, "0"}},
+    {"SLCAdvanceSeconds", {PERSISTENT, INT, "0"}},
     {"SLCConfirmationHigher", {PERSISTENT, BOOL, "0"}},
     {"SLCConfirmationLower", {PERSISTENT, BOOL, "0"}},
     {"SLCFallback", {PERSISTENT, INT}},  // Retired; preserve saved bytes for older versions.
@@ -376,6 +377,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ChestnutLoading", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION | CLEAR_ON_IGNITION_ON, BOOL}},
     {"JetlinkMode", {PERSISTENT, INT, "0"}},
     {"JetlinkChargePhone", {PERSISTENT, BOOL, "0"}},
+    {"JetlinkModel", {PERSISTENT, JSON}},
     {"JetlinkSpec", {PERSISTENT | DONT_LOG, JSON}},
     {"JetlinkPointers", {PERSISTENT | DONT_LOG, JSON}},
     {"JetlinkProgress", {CLEAR_ON_MANAGER_START | DONT_LOG, JSON}},

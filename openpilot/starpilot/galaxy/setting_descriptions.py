@@ -6,6 +6,7 @@ This presentation catalog supplies the purpose before any genuine prerequisite.
 from openpilot.starpilot.ui.long_profile_feature import CATEGORY_HELP, VALUE_HELP
 
 DESCRIPTIONS = {
+  'ReduceMotion': 'Reduces interface animations for a steadier display.',
   'IsMetric': 'On displays speed and distance in kilometers; Off uses miles. Saved speed-limit offsets keep their physical values.',
   'IsRhdDetected': 'Sets the initial steering-wheel side used by driver monitoring. Applies next drive; automatic side detection continues.',
   'FordPrefSteerAngleCurvature': 'Uses steering pinion angle instead of yaw rate to estimate Ford steering curvature. Applies at the next vehicle startup.',
@@ -61,6 +62,7 @@ DESCRIPTIONS = {
   'SpeedLimitController': 'Adjusts the set speed to accepted speed limits using your source priority and offsets.',
   'ShowSpeedLimits': 'Shows recognized speed-limit signs on the driving screen.',
   'SLCConfirmation': 'Auto adopts new limits immediately. With Automatic adoption off, + accepts and − declines within 10 seconds.',
+  'SLCAdvanceSeconds': 'Offers mapped limits early using road distance and current speed. Existing adoption and confirmation settings still apply.',
   'SLCPriority1': 'Chooses the first source checked for a fresh speed limit.',
   'SLCPriority2': 'Chooses the source used when the primary source has no fresh speed limit.',
   'slc_adopt': 'Keeps the current speed-limit offset schedule fixed when display units change.',

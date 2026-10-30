@@ -1,4 +1,5 @@
 from opendbc.car.gm.steering_authority import SteeringAuthority
+from opendbc.car.gm.values import is_volt_flashed_profile
 from opendbc.car.gps import CarGpsTracker, get_car_gps_config
 from opendbc.car.gm.values import gm_control_word, is_volt_one_pedal, camera_acc_pedal_profile, BrakeSource, volt_cc_pedal_profile
 from opendbc.car.gm.values import is_volt_longitudinal, is_gm_auto_hold
@@ -76,6 +77,9 @@ class CarState(CarStateBase):
     self.pedal_sensor_counter = None
     self.pedal_packer = CANPacker(DBC[CP.carFingerprint][Bus.pt]) if CP.flags & GMFlags.PEDAL_LONG.value else None
     self.stock_acc_status_ts_nanos = 0
+    self.bolt_acc_pedal_secondary_friction = (CP.carFingerprint == CAR.CHEVROLET_BOLT_ACC_2022_2023_PEDAL and
+                                             int(CP.safetyConfigs[0].safetyParam) == 0x1CD and is_bolt_pedal_profile(CP))
+    self.bolt_acc_pedal_friction_unavailable = False
     self.bolt_acc_brake_clock_ns = 0
     self.bolt_acc_brake_clock_counter = 0
     self.bolt_pedal_removed_sources = ()
@@ -518,14 +522,25 @@ class CarState(CarStateBase):
     ret.parkingBrake = pt_cp.vl["BCMGeneralPlatformStatus"]["ParkBrakeSwActive"] == 1
     ret.cruiseState.available = pt_cp.vl["ECMEngineStatus"]["CruiseMainOn"] != 0
     ret.espDisabled = pt_cp.vl["ESPStatus"]["TractionControlOn"] != 1
-    ret.accFaulted = (pt_cp.vl["AcceleratorPedal2"]["CruiseState"] == AccState.FAULTED or
-                      pt_cp.vl["EBCMFrictionBrakeStatus"]["FrictionBrakeUnavailable"] == 1)
+    acc_state = pt_cp.vl["AcceleratorPedal2"]["CruiseState"]
+    friction_unavailable = pt_cp.vl["EBCMFrictionBrakeStatus"]["FrictionBrakeUnavailable"] == 1
+    self.bolt_acc_pedal_friction_unavailable = self.bolt_acc_pedal_secondary_friction and friction_unavailable
+    # This exact interceptor owner drives through pedal/regen; friction is secondary.
+    # Retain the ECU bit for controller withdrawal and never hide a stock ACC fault.
+    secondary_only = self.bolt_acc_pedal_secondary_friction and acc_state == AccState.OFF
+    ret.accFaulted = acc_state == AccState.FAULTED or (friction_unavailable and not secondary_only)
 
     ret.cruiseState.enabled = pt_cp.vl["AcceleratorPedal2"]["CruiseState"] != AccState.OFF
     if is_volt_camera_removed(self.CP):
       # A missing camera can leave the ECU faulted; that is not engaged cruise.
       ret.cruiseState.enabled &= pt_cp.vl["AcceleratorPedal2"]["CruiseState"] != AccState.FAULTED
     ret.cruiseState.standstill = pt_cp.vl["AcceleratorPedal2"]["CruiseState"] == AccState.STANDSTILL
+    if is_volt_flashed_profile(self.CP):
+      # There is no stock cruise/ACC controller. Preserve the actual EBCM fault.
+      ret.accFaulted = friction_unavailable
+      ret.brakePressed |= bool(pt_cp.vl["ECMEngineStatus"]["BrakePressed"])
+      ret.cruiseState.enabled = False
+      ret.cruiseState.standstill = False
     if (self.CP.carFingerprint in CC_GATEWAY_STOCK_CAR or self.CP.carFingerprint == CAR.CHEVROLET_VOLT_CC):
       # AcceleratorPedal2 CruiseState is an ACC state, not a conventional-cruise fault source.
       ret.accFaulted = False
@@ -710,6 +725,12 @@ class CarState(CarStateBase):
       pt_messages.append(("EBCMBrakePedalPosition", 100))
     if is_volt_one_pedal(CP):
       pt_messages.append(("EVDriveMode", float('nan')))
+    if is_volt_flashed_profile(CP):
+      pt_messages += [("PSCMStatus", 10), ("ESPStatus", 10), ("EBCMWheelSpdFront", 20),
+                      ("EBCMWheelSpdRear", 20), ("EBCMFrictionBrakeStatus", 20), ("PSCMSteeringAngle", 100),
+                      ("ECMPRDNL2", 10), ("AcceleratorPedal2", 33), ("ECMEngineStatus", 100),
+                      ("BCMTurnSignals", 1), ("BCMDoorBeltStatus", 10), ("BCMGeneralPlatformStatus", 10),
+                      ("ASCMSteeringButton", 33), ("EBCMRegenPaddle", 40)]
     if CP.carFingerprint in VOLT_BSM_CAR and CP.flags & GMFlags.HAS_BSM.value:
       pt_messages.append(("BCMBlindSpotMonitor", float('nan')))
     if CP.flags & GMFlags.PEDAL_LONG.value and not is_bolt_pedal_removed_profile(CP, stock_only=True):

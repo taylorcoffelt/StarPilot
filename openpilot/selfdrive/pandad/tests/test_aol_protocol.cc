@@ -95,7 +95,8 @@ int main() {
     subaru.safety_param = static_cast<uint16_t>(word);
     subaru.capability_flags = 1U;
     const bool expected = (word == 16U) || (word == 0U) || (word == 1U) || (word == 17U) ||
-                          (word == 209U) || (word == 465U) || (word == 145U) || (word == 1169U) || (word == 1425U) || (word == 401U) || (word == 177U) || (word == 8U) || (word == 520U) || (word == 512U) || (word == 2225U);
+                          (word == 209U) || (word == 465U) || (word == 145U) || (word == 1169U) || (word == 1425U) || (word == 401U) || (word == 177U) || (word == 8U) || (word == 520U) || (word == 512U) || (word == 2225U) ||
+                          (word == 4096U) || (word == 4104U) || (word == 4608U) || (word == 4616U);
     assert(aol_capable(subaru, 11U, VEHICLE_REGISTRY) == expected);
     subaru.capability_flags = 0U;
     assert(!aol_capable(subaru, 11U, VEHICLE_REGISTRY));
@@ -374,7 +375,7 @@ int main() {
     forte.safety_mode = HYUNDAI_AOL_PROFILE.mode;
     assert(!aol_capable(forte, HYUNDAI_AOL_PROFILE.mode, VEHICLE_REGISTRY));
   }
-  for (const uint16_t word : {0U, 16U, 0xC161U, 0xC162U, 0x80U,
+  for (const uint16_t word : {0U, 16U, 0xC161U, 0xC162U, 0xC163U, 0x80U,
                             0xE100U, 0xE101U, 0xE102U, 0xE103U,
                             0xE110U, 0xE111U, 0xE112U, 0xE113U,
                             0xE200U, 0xE201U, 0xE202U, 0xE203U,
@@ -414,6 +415,7 @@ int main() {
     gateway.safety_mode = GM_AOL_PROFILE.mode;
     gateway.safety_param = word;
     assert(gm_aol_param(word));
+    assert(aol_runtime_enabled(false, gateway, VEHICLE_REGISTRY));
     queue(transport, gateway, gateway);
     const auto first = run(negotiator, transport, axis("gateway"), NOW, GM_AOL_PROFILE.mode);
     assert(first.plan.capable && first.plan.request_mask == 0U && first.outcome.compatible);
@@ -451,6 +453,7 @@ int main() {
     gm.safety_param = static_cast<uint16_t>(word);
     const auto decoded = parse_aol_status(bytes(gm).data(), sizeof(gm));
     assert(aol_capable(decoded, GM_AOL_PROFILE.mode, VEHICLE_REGISTRY) == gm_aol_param(gm.safety_param));
+    assert(aol_runtime_enabled(false, decoded, VEHICLE_REGISTRY) == gm_aol_param(gm.safety_param));
     gm.capability_flags = 0U;
     const auto absent = parse_aol_status(bytes(gm).data(), sizeof(gm));
     assert(!aol_capable(absent, GM_AOL_PROFILE.mode, VEHICLE_REGISTRY));
@@ -509,6 +512,8 @@ int main() {
     0x6A28U, 0x6A2AU, 0x7008U, 0x700AU, 0x7010U, 0x7012U, 0x7028U, 0x702AU,
     0x7090U, 0x7092U, 0x7208U, 0x720AU, 0x7228U, 0x722AU, 0x7809U, 0x7829U,
   };
+  constexpr uint16_t sportage_long_words[] = {0x0804U, 0x0806U, 0x080CU, 0x080EU, 0x0814U, 0x0816U,
+                                              0x0894U, 0x0896U, 0x0824U, 0x0826U, 0x082CU, 0x082EU};
   for (uint32_t word = 0U; word <= 0xFFFFU; ++word) {
     bool expected = word == 0x2815U || word == 0x2895U || word == 0x0815U || word == 0x0895U || word == 0x8815U || word == 0x8895U || word == 0x5491U || word == 0x5C91U || word == 0x5C95U || word == 0x5495U;
     for (uint16_t stock_word : stock_canfd_words) {
@@ -516,6 +521,9 @@ int main() {
     }
     for (uint16_t stock_word : stock_angle_words) {
       expected = expected || word == stock_word;
+    }
+    for (uint16_t sportage_word : sportage_long_words) {
+      expected = expected || word == sportage_word;
     }
     assert(hyundai_aol_param(static_cast<uint16_t>(word)) == expected);
   }

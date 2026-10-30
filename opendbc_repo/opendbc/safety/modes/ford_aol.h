@@ -30,7 +30,7 @@ static uint8_t ford_aol_owned = 0U;
 static uint32_t ford_aol_accepted_ts = 0U;
 
 // An accepted inactive actuator plus a truthful OFF/standby display can own
-// cluster continuity without owning steering. Keep the original 200ms bound.
+// cluster continuity without owning steering. Keep the existing command lease.
 #define FORD_AOL_NEUTRAL_STEERING_SEEN 0x80U
 static bool ford_aol_neutral_request_seen = false;
 static uint32_t ford_aol_neutral_steering_ts = 0U;
@@ -68,6 +68,8 @@ static bool ford_aol_neutral_packet(const CANPacket_t *msg) {
   } else if (msg->addr == 0x3D8U) {
     const unsigned int lines = msg->data[6] >> 3U;
     neutral = ((lines == 0U) || (lines == 30U)) && (((msg->data[6] >> 1U) & 3U) == 0U);
+  } else {
+    // Other packet types do not supply neutral display state.
   }
   return neutral;
 }
@@ -123,6 +125,12 @@ static void ford_aol_host_request(uint8_t mask) {
   ford_aol_neutral_request_seen = true;
   ford_aol_request_seen |= mask != 0U;
   if (ford_aol_retained_display_profile() && ((mask & 1U) == 0U)) {
+    // Bridge Off UI before the next inactive actuator without renewing its accepted-command deadline.
+    if ((mask == 0U) && ford_aol_neutral_sources_current() && ((ford_aol_owned & FORD_AOL_STEERING_OWNED) != 0U) &&
+        (safety_get_ts_elapsed(microsecond_timer_get(), ford_aol_accepted_ts) <= AOL_HOST_REQUEST_TIMEOUT_US)) {
+      ford_aol_neutral_steering_ts = ford_aol_accepted_ts;
+      ford_aol_neutral_display_mask |= FORD_AOL_NEUTRAL_STEERING_SEEN;
+    }
     ford_aol_owned &= FORD_AOL_STEERING_OWNED;
   }
 }
@@ -325,6 +333,8 @@ static void ford_aol_tx(const CANPacket_t *msg, bool accepted) {
       ford_aol_neutral_display_mask |= (msg->addr == 0x18AU) ? 1U : 2U;
     } else if (!accepted) {
       ford_aol_neutral_reset();
+    } else {
+      // No fresh neutral proof; retain the existing lease without renewing it.
     }
   }
 }

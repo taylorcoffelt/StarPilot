@@ -99,9 +99,9 @@ class TestOffroadConfigurationPages(unittest.TestCase):
       'conditional/cem': ('Speed threshold', 'Speed with lead', 'Stop lights'),
       'lane_change': ('Allow lane changes', 'Minimum lane-change speed', 'Automatic Lane Changes', 'Lane Change Speed'),
       'slc': ('Speed Limit Controller', 'Automatic adoption'),
-      'profiles': ('Short press', 'Hold', 'Force Stop', 'Selected Acceleration Profile', 'Selected Deceleration Profile'),
+      'profiles': ('Force Stop', 'Selected Acceleration Profile', 'Selected Deceleration Profile'),
       'torque': ('Steering Controller', 'Turn Assist', 'Lat Accel', 'Friction'),
-      'wheel': ('Distance long press', 'MODE press', 'Star button'),
+      'wheel': ('Short press', 'Hold', 'Distance long press', 'MODE press', 'Star button'),
     }
     for selection in (None, 'HYUNDAI_IONIQ_6'):
       self.params.put('VehicleSelection', json.loads(encode(selection)), block=True)
@@ -114,18 +114,18 @@ class TestOffroadConfigurationPages(unittest.TestCase):
             self.assertTrue(rows[label]['choices'] or rows[label]['step'], (name, label))
       self.assert_no_car_cache()
 
-  def test_fixed_ioniq6_cruise_buttons_remain_outside_remapping_catalog(self):
+  def test_ioniq6_cruise_buttons_are_in_remapping_catalog(self):
     from openpilot.starpilot.car.hyundai.settings import configuration_wheel_policy
     cp = self.context.sample().cp
     policy = configuration_wheel_policy(cp)
     assert policy is not None
-    self.assertTrue(policy.fixed_cruise_buttons)
-    self.assertFalse(policy.lkas_button_supported)
+    self.assertFalse(policy.fixed_cruise_buttons)
+    self.assertTrue(policy.lkas_button_supported)
     self.params.put('LKASButtonControl', 9, block=True)
     self.params.put('MainCruiseButtonControl', 10, block=True)
     labels = {row['label'] for row in self.page('wheel')['rows']}
-    self.assertNotIn('LKAS press', labels)
-    self.assertNotIn('Main cruise press', labels)
+    self.assertIn('LKAS press', labels)
+    self.assertIn('Main cruise press', labels)
     self.assertIn('Distance long press', labels)
     self.assertEqual(self.params.get('LKASButtonControl'), 9)
     self.assertEqual(self.params.get('MainCruiseButtonControl'), 10)
@@ -153,11 +153,13 @@ class TestOffroadConfigurationPages(unittest.TestCase):
     selection = self.params.get('VehicleSelection')
     profiles = self.page('profiles')
     rows = {row['label']: row for row in profiles['rows']}
-    for label in ('Short press', 'Hold', 'Force Stop'):
-      self.assertTrue(rows[label]['available'], label)
+    self.assertTrue(rows['Force Stop']['available'])
+    self.assertNotIn('Short press', rows)
+    self.assertNotIn('Hold', rows)
     for label, key in (('Short press', 'CustomCruise'), ('Hold', 'CustomCruiseLong')):
-      current = self.page('profiles')
+      current = self.page('wheel')
       index = next(i for i, row in enumerate(current['rows']) if row['label'] == label)
+      self.assertTrue(current['rows'][index]['available'], label)
       before = float(current['rows'][index]['value'])
       intent = self.gateway.preview(current['view'], index, 1, 'session', b'generation')
       self.assertTrue(self.gateway.confirm(intent['intent'], 'session', b'generation'))
@@ -184,8 +186,9 @@ class TestOffroadConfigurationPages(unittest.TestCase):
 
   def test_alpha_off_allows_saved_long_preferences_without_runtime_activation(self):
     self.params.put_bool('AlphaLongitudinalEnabled', False, block=True)
-    rows = {row['label']: row for row in self.page('profiles')['rows']}
-    for label in ('Short press', 'Hold', 'Force Stop'):
+    self.assertTrue(next(row for row in self.page('profiles')['rows'] if row['label'] == 'Force Stop')['available'])
+    rows = {row['label']: row for row in self.page('wheel')['rows']}
+    for label in ('Short press', 'Hold'):
       self.assertTrue(rows[label]['available'], label)
     self.assertFalse(self.context.sample().cp.openpilotLongitudinalControl)
     self.assertFalse(self.params.get_bool('AlphaLongitudinalEnabled'))
