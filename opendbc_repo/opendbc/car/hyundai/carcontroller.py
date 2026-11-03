@@ -24,9 +24,10 @@ from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.ray_pedal import create_ray_pedal_command, ray_pedal_gas, ray_pedal_enabled
 from opendbc.car.hyundai.ioniq6_longitudinal import Ioniq6LongitudinalPolicy
+from opendbc.car.hyundai.ioniq6_bsm import BlindspotStatus
 from opendbc.car.hyundai.canfd_dash_icons import CanFDDashIcons
 from opendbc.car.hyundai.classic_scc_aol import qualified as qualified_classic_stock_aol
-from opendbc.car.hyundai.classic_long_aol import independent_buttons_qualified as qualified_classic_long_buttons
+from opendbc.car.hyundai.classic_long_aol import AOL_EXPERIENCE, qualified as qualified_classic_long_aol
 from opendbc.car.hyundai.canfd_stock_aol import qualified as qualified_canfd_stock_aol, qualified_long as qualified_canfd_long_aol
 from opendbc.car.hyundai.ev6_aol import qualified as qualified_ev6_aol
 from opendbc.car.hyundai.g90_longitudinal import G90LongitudinalPolicy
@@ -77,7 +78,7 @@ def angle_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain):
 
 def classic_aol_dash_enabled(cp):
   return bool(cp.carFingerprint != CAR.KIA_RAY_EV and (qualified_classic_stock_aol(cp, marked_only=True) or
-    cp.carFingerprint == CAR.HYUNDAI_ELANTRA_2021 and qualified_classic_long_buttons(cp, marked_only=True)))
+    cp.alternativeExperience == AOL_EXPERIENCE and qualified_classic_long_aol(cp, marked_only=True)))
 
 
 def process_hud_alert(enabled, fingerprint, hud_control):
@@ -296,6 +297,7 @@ class CarController(CarControllerBase):
     self.frame += 1
     if _projection is not None:
       _projection.finish(new_actuators.torque)
+    can_sends.extend(CS.daw.command(now_nanos))
     return new_actuators, can_sends
 
   def create_can_msgs(self, apply_steer_req, apply_torque, torque_fault, set_speed_in_units, accel, stopping,
@@ -587,6 +589,9 @@ class CarController(CarControllerBase):
           can_now_ns = getattr(CS, "ioniq6_bsm_now_ns", 0)
           status = (sources.status(can_now_ns) if sources is not None and can_now_ns > self.ioniq6_bsm_last_can_ns else None)
           if status is not None:
+            # Neutralize only the injected dashboard indication below 5 mph.
+            if CS.out.vEgoRaw < 5 * CV.MPH_TO_MS:
+              status = BlindspotStatus(0, 0)
             can_sends.extend(hyundaicanfd.create_ioniq6_blindspot_status(self.ioniq6_bsm_counter, status))
             self.ioniq6_bsm_counter = (self.ioniq6_bsm_counter + 1) & 0xff
             self.ioniq6_bsm_last_can_ns = can_now_ns

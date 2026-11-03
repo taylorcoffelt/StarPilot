@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.selfdrive.car.cruise import V_CRUISE_MIN, V_CRUISE_MAX
+from openpilot.starpilot.aol.runtime import current_axis
 from openpilot.starpilot.speed_limits import acceptance as acc
 from openpilot.starpilot.speed_limits import action_arbitration as arb
 from openpilot.starpilot.speed_limits import composition as comp
@@ -209,6 +210,11 @@ class Runtime:
       raise ValueError('invalid SLC advance time')
     self.settings = replace(self.settings, advance_seconds=seconds)
     if seconds == 0:
+      encounter, pending = self.advance.encounter, self.state.acceptance.pending
+      if (encounter is not None and not encounter.crossed and pending is not None and
+          pending.candidate.source == 'map' and pending.candidate.speed_mps == encounter.speed_mps):
+        self.state = replace(self.state, acceptance=replace(self.state.acceptance,
+          observation=acc.Observation(acc.ObservationKind.UNKNOWN), pending=None, presentation=None, timer_running=False))
       self.advance.disable()
 
   def _event_current(self, event: CruiseEvent, sm, now_ns: int) -> bool:
@@ -253,27 +259,41 @@ class Runtime:
     self.ledger = completed.state
     return classified if not classified.errors and classified.change is not None else None
 
-  def _physical_action(self, event: CruiseEvent, sm, now_ns: int) -> tuple[acc.DriverAction | None, int | None]:
-    if (event.kind not in ('confirmationAccept', 'confirmationReject') or
+  def _physical_action(self, event: CruiseEvent, sm, now_ns: int) -> tuple[acc.DriverAction | None, acc.AdoptRequest | None, int | None]:
+    if (event.kind not in ('confirmationAccept', 'confirmationReject', 'engagementAdopt') or
         not self._event_current(event, sm, now_ns)):
-      return None, None
+      return None, None, None
     self._mark_event(event)
+    engagement = event.kind == 'engagementAdopt'
     pending = self.state.acceptance.pending
     shown = self.state.acceptance.presentation
-    if (event.session_id != self.session_id or pending is None or shown is None or
+    retained_reject = (event.kind == 'confirmationReject' and event.presentation_id == 0 and
+                       pending is not None and event.decision_id == pending.decision_id)
+    if shown is None and engagement:
+      shown = self.current_presentation
+    if (event.session_id != self.session_id or (shown is None and not retained_reject) or
         event.producer_session != str(sm['slcDashboardObservation'].producerSessionId) or
-        event.decision_id != pending.decision_id or event.presentation_id != shown.presentation_id or
-        pending.candidate != shown.candidate or
+        (not retained_reject and event.presentation_id != shown.presentation_id) or
         event.button != ('accel' if event.kind == 'confirmationAccept' else 'decel')):
-      return None, None
+      return None, None, None
+    if engagement:
+      if (event.command_id != 0 or not _number(event.selected_mps, positive=True) or
+          not _number(float(sm['carState'].vCruise), positive=True) or
+          abs(float(sm['carState'].vCruise) / 3.6 - event.selected_mps) > 0.1):
+        return None, None, None
+    elif pending is None or event.decision_id != pending.decision_id or (not retained_reject and pending.candidate != shown.candidate):
+      return None, None, None
     action_id = self.ledger.last_action_id + 1
-    begun = arb.step(self.ledger, arb.BeginAction(self.session_id, action_id, arb.Origin.DRIVER_CRUISE,
-                                                  f'pending:{pending.decision_id}'), now_ns=now_ns)
+    context = f'presentation:{shown.presentation_id}' if engagement else f'pending:{pending.decision_id}'
+    begun = arb.step(self.ledger, arb.BeginAction(self.session_id, action_id, arb.Origin.DRIVER_CRUISE, context), now_ns=now_ns)
     self.ledger = begun.state
     if begun.errors or begun.status != 'begun':
-      return None, None
+      return None, None, None
+    if engagement:
+      return None, acc.AdoptRequest(self.session_id, action_id, shown.presentation_id, shown.candidate), action_id
+    assert pending is not None
     kind = acc.ActionKind.ACCEPT if event.kind == 'confirmationAccept' else acc.ActionKind.REJECT
-    return acc.DriverAction(self.session_id, action_id, pending.decision_id, kind), action_id
+    return acc.DriverAction(self.session_id, action_id, pending.decision_id, kind), None, action_id
 
   def _command_receipt(self, event: CruiseEvent, sm, now_ns: int) -> None:
     if (event.kind not in ('commandApplied', 'commandRejected') or
@@ -373,6 +393,9 @@ class Runtime:
                      selfdrive.enabled and car_fresh and selfdrive_fresh)
     long_enabled = bool(car_fresh and controls_fresh and selfdrive_fresh and car_control_fresh and
                         selfdrive.enabled and sm['carControl'].enabled)
+    if 'aolAxisState' in sm.logMonoTime:
+      axis = current_axis(sm, now_ns=now_ns)
+      long_enabled = long_enabled and bool(axis is not None and axis.nativeAcknowledged and axis.desiredLongitudinal)
     lateral = bool(car_control_fresh and sm['carControl'].latActive and selfdrive_fresh)
     authority = _authority(CP, sm, host_long, lateral, long_enabled=long_enabled)
     authority = replace(authority, accelerator_override=bool(CP.openpilotLongitudinalControl and long_enabled and car_state.gasPressed))
@@ -390,6 +413,11 @@ class Runtime:
                       ego, bool(car_state.gasPressed) if car_fresh else False, host, action=action, adopt=adopt,
                       classified_cruise=classified, is_metric=self.is_metric, set_speed_ready=self._set_speed_ready(sm))
     current = sel.select_limit(observations, self.settings.selection).observation.candidate
+    shown = self.state.acceptance.presentation
+    if self.advance.encounter is not None and shown is not None and current != self.last_received:
+      identity = self.state.acceptance.next_presentation_id
+      self.state = replace(self.state, acceptance=replace(self.state.acceptance,
+        presentation=acc.Presentation(identity, shown.candidate), next_presentation_id=identity+1))
     if (adopt is not None and self.advance.encounter is not None and
         adopt.candidate == self.last_received == current):
       self.advance.use_current(adopt.candidate)
@@ -399,7 +427,8 @@ class Runtime:
         current_way_id=self.map_source.way_id, seconds=self.settings.advance_seconds,
         speed_mps=float(car_state.vEgo) if ego_valid else None,
         standstill=bool(getattr(car_state, 'standstill', False)) or str(getattr(car_state, 'gearShifter', '')) == 'reverse',
-        can_offer=self.settings.enabled and authority.can_control and not host.force_decel, now_ns=now_ns)
+        can_offer=self.settings.enabled and authority.can_control and not host.force_decel,
+        confirmation_active=authority.can_control, now_ns=now_ns)
     return replace(frame, adoption_observations=proposals, confirmation_started_ns=self.advance.started_ns)
 
   def _action(self, request: Action | None, now_ns: int) -> tuple[acc.DriverAction | None, acc.AdoptRequest | None, int | None]:
@@ -411,13 +440,11 @@ class Runtime:
     shown = self.state.acceptance.presentation
     if shown is None and request.kind == 'adopt':
       shown = self.current_presentation
-    if shown is None or shown.presentation_id != request.presentation_id:
+    pending = self.state.acceptance.pending
+    retained_reject = (request.kind == 'reject' and request.presentation_id == 0 and
+                       pending is not None and request.decision_id == pending.decision_id)
+    if not retained_reject and (shown is None or shown.presentation_id != request.presentation_id):
       return None, None, None
-    if request.kind == 'adopt' and self.advance.encounter is not None and self.state.acceptance.pending is None and self.last_received is not None:
-      # The adopt wheel action still means the displayed current limit.
-      shown = replace(shown, candidate=self.last_received)
-      self.state = replace(self.state, acceptance=replace(self.state.acceptance, presentation=shown,
-        observation=acc.Observation(acc.ObservationKind.VALID, shown.candidate)))
     action_id = self.ledger.last_action_id + 1
     context = self.state.override.context
     context_id = context.context_id if context is not None else "slc-presentation"
@@ -445,7 +472,14 @@ class Runtime:
       self._command_receipt(cruise_event, sm, now_ns)
     action, adopt, action_id = self._action(request, now_ns)
     if cruise_event is not None and request is None:
-      action, action_id = self._physical_action(cruise_event, sm, now_ns)
+      action, adopt, action_id = self._physical_action(cruise_event, sm, now_ns)
+    if (adopt is not None and self.advance.encounter is not None and self.last_received is not None and
+        (request is None or self.state.acceptance.pending is None)):
+      # Explicit adoption uses the current road, including SET over an old early prompt.
+      shown = acc.Presentation(adopt.presentation_id, self.last_received)
+      adopt = replace(adopt, candidate=shown.candidate)
+      self.state = replace(self.state, acceptance=replace(self.state.acceptance, presentation=shown, pending=None, timer_running=False,
+        observation=acc.Observation(acc.ObservationKind.VALID, shown.candidate)))
     frame = self._frame(sm, CP, now_ns, now_boot_ns, action, adopt, classified)
     result = comp.step(self.state, frame)
     self.state = result.state
@@ -633,9 +667,10 @@ class Runtime:
         setattr(state, flag_field, True)
     if state.hasPresentationAdjustedLimit and not self.advance.boundary_id:
       state.offset = float(state.presentationAdjustedLimit) - float(state.speedLimit)
-    if shown is not None:
+    # A retained choice gets an Accept presentation only when fresh evidence matches it.
+    if shown is not None and (pending is None or pending.candidate == shown.candidate):
       state.presentationId = shown.presentation_id
-    elif self.current_presentation is not None and self.current_presentation.candidate == current_selection.observation.candidate:
+    elif pending is None and self.current_presentation is not None and self.current_presentation.candidate == current_selection.observation.candidate:
       state.presentationId = self.current_presentation.presentation_id
     state.status = result.status
     if state.source == 'dashboard' and state.observationKind == 'valid':

@@ -4,6 +4,7 @@ import math
 
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.selfdrive.car.cruise import SlcPendingConfirmation, V_CRUISE_MIN, V_CRUISE_MAX
+from openpilot.starpilot.speed_limits.acceptance import CONFIRMATION_NS
 from openpilot.starpilot.speed_limits.selection import Source
 
 
@@ -40,7 +41,7 @@ def source_matches(state, observation, producer_session: str, now_ns: int) -> bo
           abs(float(state.speedLimit) - float(observation.speed_mps)) <= 0.02)
 
 
-def _current_state(sm, now_ns: int):
+def _state(sm, now_ns: int):
   if not (sm.valid['slcState'] and sm.alive['slcState'] and
           0 < int(sm.logMonoTime['slcState']) <= now_ns and
           now_ns - int(sm.logMonoTime['slcState']) <= STATE_MAX_AGE_NS):
@@ -48,11 +49,15 @@ def _current_state(sm, now_ns: int):
   state = sm['slcState']
   if not (state.enabled and not state.displayOnly and str(state.sessionId) and
           0 < int(state.frameMonoTime) <= int(sm.logMonoTime['slcState']) and
-          now_ns - int(state.frameMonoTime) <= STATE_MAX_AGE_NS and
-          str(state.observationKind) == 'valid' and str(state.source) in tuple(Source) and finite_speed(state.speedLimit) and
-          adoption_speed(state) is not None):
+          now_ns - int(state.frameMonoTime) <= STATE_MAX_AGE_NS):
     return None
   return state
+
+
+def _current_state(sm, now_ns: int):
+  state = _state(sm, now_ns)
+  return state if (state is not None and str(state.observationKind) == 'valid' and
+                   str(state.source) in tuple(Source) and finite_speed(state.speedLimit) and adoption_speed(state) is not None) else None
 
 
 def state_current(sm, observation, producer_session: str, now_ns: int):
@@ -65,16 +70,40 @@ def state_current(sm, observation, producer_session: str, now_ns: int):
   return state
 
 
+def engagement_state(sm, observation, producer_session: str, now_ns: int, *, after_ns: int = 0):
+  state = _current_state(sm, now_ns)
+  if (state is None or int(state.frameMonoTime) <= after_ns or int(state.presentationId) <= 0 or
+      str(state.source) == 'online' or not state.hasPresentationAdjustedLimit):
+    return None
+  if str(state.source) == 'dashboard' and (
+      observation is None or observation.observed_ns <= after_ns or not source_matches(state, observation, producer_session, now_ns)):
+    return None
+  if str(state.source) == 'vision' and not (
+      state.sourceProducerSessionId and state.sourceEpisode > 0 and
+      0 < state.sourceObservedMonoTime <= now_ns <= state.sourceValidUntilMonoTime):
+    return None
+  target = float(state.presentationAdjustedLimit)
+  return state if finite_speed(target) and V_CRUISE_MIN / 3.6 - 1e-5 <= target <= V_CRUISE_MAX / 3.6 + 1e-5 else None
+
+
 def pending_confirmation(sm, now_ns: int, *, long_active: bool,
                          after_ns: int = 0) -> SlcPendingConfirmation | None:
   if not long_active:
     return None
   # The planner owns pending choices for every source; Dashboard commands also bind local OEM evidence.
-  state = _current_state(sm, now_ns)
+  state = _state(sm, now_ns)
   if (state is None or int(state.frameMonoTime) <= after_ns or not state.hasPending or state.automaticAdoptionPending or
-      int(state.decisionId) <= 0 or int(state.presentationId) <= 0):
+      int(state.decisionId) <= 0 or int(state.presentationId) < 0):
     return None
-  if not finite_speed(state.pendingSpeedLimit) or abs(float(state.pendingSpeedLimit) - adoption_speed(state)) > 0.02:
+  if not finite_speed(state.pendingSpeedLimit):
+    return None
+  if int(state.presentationId) == 0:
+    started = int(state.pendingSinceMonoTime)
+    # Consume the displayed choice even if its deadline passes in transit.
+    if str(state.pendingSource) not in tuple(Source) or not 0 < started <= int(state.frameMonoTime) <= started + CONFIRMATION_NS:
+      return None
+  elif (_current_state(sm, now_ns) is None or
+        abs(float(state.pendingSpeedLimit) - adoption_speed(state)) > 0.02):
     return None
   return SlcPendingConfirmation(str(state.sessionId), int(state.decisionId), int(state.presentationId))
 

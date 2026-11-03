@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
 
-import pyray as rl
+from openpilot.starpilot.ui.raylib import rl
 
 from openpilot.starpilot.ui import onroad
 from openpilot.starpilot.ui.onroad import axis_status_color, clock_text, driving_mode_description
@@ -281,13 +281,23 @@ class TestOnroadAxes(unittest.TestCase):
       (OnroadAlert(size=AlertSize.SMALL, text1='Steering Paused'), (10, 186, 181, 255)),
       (OnroadAlert(size=AlertSize.MID), (10, 186, 181, 255)),
       (OnroadAlert(size=AlertSize.FULL), blue), (OnroadAlert(size=AlertSize.SMALL, critical=True), blue))]
-    for lateral, longitudinal, override, alert, compact_color, latched in cases:
-      state = replace(self.state(lateral, longitudinal), driver_override_active=override, alert=alert, aol_latched=latched)
+    cases = [(*case, False) for case in cases]
+    cases += [(True, True, override, alert, color, None, True) for override, alert, color in (
+      (False, OnroadAlert(), (201, 34, 49, 255)),
+      (False, OnroadAlert(size=AlertSize.SMALL, critical=True), blue),
+      (False, OnroadAlert(), (201, 34, 49, 255)),
+      (True, OnroadAlert(), gray),
+      (False, OnroadAlert(size=AlertSize.FULL), blue),
+      (False, OnroadAlert(), (201, 34, 49, 255)))]
+    for lateral, longitudinal, override, alert, compact_color, latched, traffic in cases:
+      state = replace(self.state(lateral, longitudinal), driver_override_active=override, alert=alert,
+                      aol_latched=latched, traffic_mode=traffic)
       for layout in state.customization['layouts'].values():
         layout[MODE_WIDGET]['enabled'] = True
       for profile in (Profile.LARGE, Profile.COMPACT):
         with self.subTest(profile=profile, lateral=lateral, longitudinal=longitudinal, override=override, alert=alert):
           view = onroad.OnroadView.__new__(onroad.OnroadView)
+          view.personality = Mock()
           object.__setattr__(view, "fonts", NS(profile=profile, draw=Mock(), measure=Mock(return_value=NS(width=100, height=30)),
                                               vertical_ink=Mock(return_value=(0, 20)), horizontal_ink=Mock(return_value=(0, 100))))
           view.camera_layer = Mock()
@@ -349,6 +359,7 @@ class TestOnroadAxes(unittest.TestCase):
     state = self.state(True, True)
     for profile in (Profile.LARGE, Profile.COMPACT):
       view = onroad.OnroadView.__new__(onroad.OnroadView)
+      view.personality = Mock()
       self.enterContext(patch.object(view, 'fonts', NS(profile=profile, draw=Mock()), create=True))
       view._driving_mode(state)
       view.fonts.draw.assert_not_called()

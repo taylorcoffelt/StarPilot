@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pyray as rl
+from openpilot.starpilot.ui.raylib import rl
 import pytest
 
 from openpilot.starpilot.ui.onroad_compact_widgets import CompactHudRenderer
@@ -49,6 +49,7 @@ def fonts(profile=Profile.LARGE):
 
 def slc_view(font):
   view = OnroadView.__new__(OnroadView)
+  view.personality = Mock()
   view.fonts = font
   if font.profile == Profile.LARGE:
     view.unified_speed = UnifiedSpeedWidget(font)
@@ -291,6 +292,18 @@ def test_compact_max_restores_dinish_number_label_and_shadow(drawing):
   drawing['draw_circle_gradient'].assert_called_once()
 
 
+@pytest.mark.parametrize('metric', [False, True])
+@pytest.mark.parametrize('engaged', [False, True])
+def test_compact_unset_max_stays_hidden(metric, engaged, drawing):
+  font = fonts(Profile.COMPACT)
+  hud = CompactHudRenderer(font, Mock())
+  current = state(metric=metric, engaged=engaged, longitudinal_active=engaged, cruise_kph=None, drive_frame=1)
+  hud.render_max_speed(current)
+  hud.render_max_speed(replace(current, observed_ns=current.observed_ns + 20_000_000))
+  font.draw.assert_not_called()
+  drawing['draw_circle_gradient'].assert_not_called()
+
+
 def test_large_limit_keeps_a_unit_when_set_speed_is_hidden():
   profile = Profile.LARGE
   current = state()
@@ -306,6 +319,7 @@ def test_large_limit_keeps_a_unit_when_set_speed_is_hidden():
 @pytest.mark.parametrize('profile', list(Profile))
 def test_chooser_has_separate_tonal_actions_and_immediate_pressed_feedback(profile, drawing):
   view = OnroadView.__new__(OnroadView)
+  view.personality = Mock()
   view.fonts = fonts(profile)
   if profile == Profile.LARGE:
     view.unified_speed = UnifiedSpeedWidget(view.fonts)

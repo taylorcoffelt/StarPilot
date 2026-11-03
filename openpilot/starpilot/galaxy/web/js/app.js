@@ -1,3 +1,4 @@
+import { startLocalization } from "./localization.js"
 import { rememberInstallPrompt } from "./install-app.js"
 import { toggleHaptic } from "./haptics.js"
 import { GxState } from "./state.js"
@@ -71,9 +72,10 @@ const state = reactive({
   theme: stored(THEME_KEY) === "light" ? "light" : "dark",
   searchPage: "",
 })
-const updateRestart = new UpdateRestart({ publish: waiting => {
+const updateRestart = new UpdateRestart({ publish: (waiting, error) => {
   state.updateRestarting = waiting
   if (waiting) showRestartScreen()
+  else if (error) showBootScreen("failed", error, true)
   else if (bootScreenMode() === "restart" && !state.loading) dismissBootScreen()
 } })
 const deviceRestart = new DeviceRestartWatch({ paused: () => state.updateRestarting })
@@ -157,6 +159,7 @@ createApp({
     sessionExpired() { if (initializing) return; auth.expired(); initialize() },
   },
   mounted() {
+    this.stopLocalization = startLocalization()
     document.documentElement.dataset.theme = state.theme
     this.visibility = () => {
       if (!document.hidden) deviceRestart.wake()
@@ -177,6 +180,7 @@ createApp({
     })
   },
   beforeUnmount() {
+    this.stopLocalization?.()
     reconnectEnabled = false
     clearTimeout(reconnectTimer)
     startupGeneration++
@@ -263,10 +267,8 @@ createApp({
         <SettingsPage @nested="ensureBackEntry" ref="activeSettings" v-else-if="drivingSettingsPage" :key="drivingSettingsPage" :mode="state.monitorMode" :unauthorized="sessionExpired" :initial-page="drivingSettingsPage" :title="'Driving settings · ' + drivingSettingsPage.replaceAll('_', ' ')" :return-to="returnToDriving" />
         <SettingsPage @nested="ensureBackEntry" ref="activeSettings" v-else-if="route.path === '/settings'" :key="state.searchPage || 'hub'" :mode="state.monitorMode" :unauthorized="sessionExpired"
           :initial-page="state.searchPage || 'hub'" :return-to="state.searchPage ? returnFromSearch : null" />
-        <div v-else-if="['/tuning', '/tuning/plots', '/tuning/flm'].includes(route.path)" class="gx-stack">
-          <PlotsPage :mode="state.monitorMode" :unauthorized="sessionExpired" />
-          <FlmPage embedded :mode="state.monitorMode" :unauthorized="sessionExpired" />
-        </div>
+        <FlmPage v-else-if="['/tuning', '/tuning/flm'].includes(route.path)" :mode="state.monitorMode" :unauthorized="sessionExpired" :go="go" />
+        <PlotsPage v-else-if="route.path === '/tuning/plots'" :mode="state.monitorMode" :unauthorized="sessionExpired" />
         <GxState v-else :title="pageName">This capability is unavailable in this build. No operation was attempted.</GxState>
       </div></Transition></div></main>
       <BottomNav :path="route.path" @navigate="go" />

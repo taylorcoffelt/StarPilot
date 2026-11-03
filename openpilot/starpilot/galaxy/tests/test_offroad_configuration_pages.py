@@ -58,9 +58,16 @@ class TestOffroadConfigurationPages(unittest.TestCase):
             expected = saved[name]
             if name == 'developer':
               self.assertEqual([row[0] for row in expected], ['Use VOACC'])
-              self.assertFalse(expected[0][1])
-              self.assertTrue(current[0][1])
+              self.assertEqual([row[1] for row in expected], [False])
+              self.assertEqual([row[1] for row in current], [True])
               expected = [(row[0], True, *row[2:]) for row in expected]
+            if name == 'profiles':
+              # Saved configuration uses the native catalog; this preference is Galaxy-only.
+              label = 'Disengage on Accelerator Pedal'
+              self.assertNotIn(label, [row[0] for row in expected])
+              self.assertEqual([row for row in current if row[0] == label],
+                               [(label, True, ('Off', 'On'), 0.0, 0.0, 0.0)])
+              current = [row for row in current if row[0] != label]
             self.assertEqual(expected, current)
         self.assert_no_car_cache()
 
@@ -71,9 +78,9 @@ class TestOffroadConfigurationPages(unittest.TestCase):
     self.assertFalse(context.cp.openpilotLongitudinalControl)
     self.assertTrue(context.configuration_longitudinal)
     page = self.page('slc')
-    index = next(i for i, row in enumerate(page['rows']) if row['label'] == 'Adopt fixed offsets')
+    index = next(i for i, row in enumerate(page['rows']) if row['label'].endswith('offset'))
     self.assertTrue(page['rows'][index]['available'])
-    intent = self.gateway.preview(page['view'], index, 0, 'session', b'generation')
+    intent = self.gateway.preview(page['view'], index, 0, 'session', b'generation', value=3)
     self.assertTrue(self.gateway.confirm(intent['intent'], 'session', b'generation'))
     self.assertTrue(next(row for row in self.page('slc')['rows'] if row['label'] == 'Speed Limit Controller')['available'])
     self.assertFalse(self.params.get_bool('AlphaLongitudinalEnabled'))
@@ -90,8 +97,8 @@ class TestOffroadConfigurationPages(unittest.TestCase):
 
   def test_saved_and_manual_contexts_expose_expected_core_settings(self):
     offsets = self.page('slc')
-    index = next(i for i, row in enumerate(offsets['rows']) if row['label'] == 'Adopt fixed offsets')
-    intent = self.gateway.preview(offsets['view'], index, 0, 'session', b'generation')
+    index = next(i for i, row in enumerate(offsets['rows']) if row['label'].endswith('offset'))
+    intent = self.gateway.preview(offsets['view'], index, 0, 'session', b'generation', value=3)
     self.assertTrue(self.gateway.confirm(intent['intent'], 'session', b'generation'))
     expected = {
       'aol': ('Enable Always On Lateral', 'Brake pause below'),
