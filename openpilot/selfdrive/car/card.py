@@ -60,6 +60,7 @@ from opendbc.car.ford.aol import (
   temporary_restriction as ford_temporary_restriction,
 )
 from opendbc.car.hyundai.canfd_angle_aol import native_observation, temporary_restriction, qualified as qualified_angle_aol
+from opendbc.car.hyundai.blended_stock_aol import qualified_alpha as qualified_blended_alpha_aol
 from opendbc.car.hyundai.canfd_owner import config_index as hyundai_canfd_config_index
 from opendbc.car.hyundai.captured_adrv_startup import CapturedADRVStartup
 from openpilot.starpilot.car.nissan.aol import (
@@ -92,7 +93,7 @@ from openpilot.starpilot.feature_runtime import (requested as feature_requested,
 from openpilot.starpilot.saved_source import read_saved
 from openpilot.starpilot.vehicle_selection import startup_candidate
 from openpilot.starpilot.vehicle_preferences import VehicleStartupPreferences
-from openpilot.starpilot.controller_extensions import configure_controller, observe_controller_can
+from openpilot.starpilot.controller_extensions import configure_controller, observe_controller_can, order_controller_can
 from openpilot.starpilot.vehicle_startup import VehicleStartupOwner
 from openpilot.starpilot.controllers.wheel_actions import WheelPublisher, key_for
 from openpilot.starpilot.controllers.cruise_action import CruiseActionConsumer, eligible as cruise_action_eligible
@@ -513,13 +514,18 @@ class Car:
   def state_update(self, *, defer_radar=False) -> tuple[car.CarState, structs.RadarDataT | None]:
     """carState update loop, driven by can"""
 
+    timing = getattr(self, '_cycle_timing', None)
     can_strs = messaging.drain_sock_raw(self.can_sock, wait_for_one=True)
     can_received_ns = time.monotonic_ns()
+    if timing is not None:
+      timing.mark('can_receive')
     can_list = can_capnp_to_list(can_strs)
 
     # Update carState from CAN
     observe_controller_can(self.CI, can_list)
     CS = self.CI.update(can_list)
+    if timing is not None:
+      timing.mark('can_parse')
     from openpilot.starpilot.car.gm.aol import f1_conventional_lateral_owner
     cancel_boot_ns = (time.clock_gettime_ns(time.CLOCK_BOOTTIME)
                       if (getattr(self.CI.CS, 'ev6_aol_source_healthy', False) or
@@ -539,6 +545,8 @@ class Car:
     RD = None if defer_radar else self.radar_update(can_list)
 
     self.sm.update(0)
+    if timing is not None:
+      timing.mark('service_update')
 
     self.update_vehicle_state_context(CS)
 
@@ -608,9 +616,10 @@ class Car:
         self.aol_card_intent, cancel_source_ns=cancel_source_ns, now_ns=now_ns,
         producer=getattr(self, 'slc_producer_session', ''))
       cancel_feedback = self.aol_transport_feedback
-      if (hkg_cancel_retained and self.CP.carFingerprint in (HYUNDAI_CAR.KIA_EV9, HYUNDAI_CAR.HYUNDAI_IONIQ_5_PE) and
+      if (hkg_cancel_retained and (self.CP.carFingerprint in (HYUNDAI_CAR.KIA_EV9, HYUNDAI_CAR.HYUNDAI_IONIQ_5_PE) or
+          qualified_blended_alpha_aol(self.CP, marked_only=True)) and
           cancel_feedback is not None and not cancel_feedback.longitudinal_cancel_ns):
-        # The pure guard proved this exact CCNC raw CANCEL/FULL join. Bind
+        # The pure guard proved this exact raw CANCEL/FULL join. Bind
         # its first local receipt for the existing bounded withdrawal handshake;
         # held samples never renew it or any source/native/output deadline.
         if cancel_source_ns > cancel_feedback.last_cancel_source_ns:
@@ -1037,21 +1046,35 @@ class Car:
       self.pm.send('carParams', cp_send)
       self.car_params_published = True
 
+    timing = getattr(self, '_cycle_timing', None)
+    if timing is not None:
+      timing.publication_mark('begin')
+
     # publish new carOutput
     co_send = messaging.new_message('carOutput')
     co_send.valid = self.sm.all_checks(['carControl'])
     co_send.carOutput.actuatorsOutput = self.last_actuators_output
     self.learning_feedback_publication = None
+    if timing is not None:
+      timing.publication_mark('car_output_create')
     capture = self._feedback_capture(int(co_send.logMonoTime))
+    if timing is not None:
+      timing.publication_mark('feedback_capture')
     if capture is not None:
       try:
         self.learning_feedback_publication = capture.publication(co_send)
       except Exception:
         capture.invalidate()  # Optional observation cannot affect the original CO.
+    if timing is not None:
+      timing.publication_mark('feedback_publication')
     self.pm.send('carOutput', co_send)
+    if timing is not None:
+      timing.publication_mark('car_output_send')
 
     # kick off controlsd step while we actuate the latest carControl packet
     cs_send = messaging.new_message('carState')
+    if timing is not None:
+      timing.publication_mark('car_state_create')
     if (self.slc_replay or self.curve_replay or getattr(self, 'conditional_replay', False)) and REPLAY and hasattr(self, 'can_log_mono_time'):
       cs_send.logMonoTime = int(self.can_log_mono_time)
     cs_send.valid = CS.canValid
@@ -1465,6 +1488,8 @@ class Car:
       self._clear_learning_evidence()
 
   def publish_sendcan(self, frames, valid=True):
+    if valid:
+      frames = order_controller_can(getattr(self, 'CI', None), frames)
     steering_authority = getattr(getattr(getattr(self, 'CI', None), 'CS', None), 'steering_authority', None)
     monitored_steering = (getattr(getattr(self, 'CP', None), 'brand', None) == 'gm' and
                           steering_authority is not None and steering_authority.enabled)
@@ -1829,11 +1854,16 @@ class Car:
       self.CC_prev = CC
 
   def step(self):
+    timing = getattr(self, '_cycle_timing', None)
     CS, RD = self.state_update(defer_radar=True)
+    if timing is not None:
+      timing.mark('state_decision')
 
     if self.vehicle_startup.owner is not None:
       self.vehicle_startup.maintain(configured=self.startup_panda_configured())
     self.state_publish(CS, RD)
+    if timing is not None:
+      timing.mark('publish_state')
 
     initialized = (not any(e.name == EventName.selfdriveInitializing for e in self.sm['onroadEvents']) and
                    self.sm.seen['onroadEvents'])
@@ -1847,9 +1877,13 @@ class Car:
            self.classic_startup_keepalive() or self.torque_ev_startup_keepalive() or self.mixed_startup_keepalive())):
       self.controls_update(CS, self.sm['carControl'], initialize_only=True)
 
+    if timing is not None:
+      timing.mark('apply_control')
     radar_can = self._deferred_radar_can
     self._deferred_radar_can = None
     self.radar_publish(self.radar_update(radar_can))
+    if timing is not None:
+      timing.mark('radar')
     self.initialized_prev = initialized
     self.CS_prev = CS
 
@@ -1886,16 +1920,29 @@ class Car:
       time.sleep(0.1)
 
   def card_thread(self):
+    from openpilot.starpilot.diagnostics.card_timing import CardTiming
+    self._cycle_timing = CardTiming(cloudlog.event)
     self.configure_conditional_settings_worker()
     e = threading.Event()
     t = threading.Thread(target=self.params_thread, args=(e, ))
     try:
       t.start()
       while True:
+        timing = self._cycle_timing
+        if timing is not None:
+          timing.begin()
         self.vehicle_startup.check()
+        if timing is not None:
+          timing.mark('startup')
         self.step()
+        if timing is not None:
+          timing.finish()
+          if not timing.enabled:
+            self._cycle_timing = None
         self.rk.monitor_time()
     finally:
+      if self._cycle_timing is not None:
+        self._cycle_timing.close()
       e.set()
       t.join()
       if self.ioniq6_keepalive is not None:

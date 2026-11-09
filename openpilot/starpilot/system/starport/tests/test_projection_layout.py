@@ -34,6 +34,35 @@ class TestProjectionLayout(unittest.TestCase):
           self.assertGreaterEqual(placed[axis], metadata['bounds'][axis])
           self.assertLessEqual(placed[axis] + widget[extent], metadata['bounds'][axis] + metadata['bounds'][extent])
 
+  def test_saved_layout_survives_a_new_widget_and_a_stale_one(self):
+    document = default_layout(SCREEN)
+    document['widgets']['steering_wheel'].update(x=500, y=400, enabled=False)
+    del document['widgets']['weather']
+    document['widgets']['retired_widget'] = {'x': 0, 'y': 0, 'enabled': True}
+    document['widgets']['nav_card']['x'] = 99999
+    decoded = decode_layout(json.dumps(document).encode(), SCREEN)
+    self.assertEqual({key: decoded['widgets']['steering_wheel'][key] for key in ('x', 'y', 'enabled')}, {'x': 500, 'y': 400, 'enabled': False})
+    self.assertEqual(decoded['widgets']['weather'], default_layout(SCREEN)['widgets']['weather'])
+    self.assertNotIn('retired_widget', decoded['widgets'])
+    metadata = layout_metadata(SCREEN)
+    bounds, card = metadata['bounds'], metadata['widgets']['nav_card']
+    self.assertEqual(decoded['widgets']['nav_card']['x'], bounds['x'] + bounds['width'] - card['width'])
+
+  def test_salvage_still_rejects_a_different_screen(self):
+    document = default_layout(SCREEN)
+    document['canvas'] = {'width': 1, 'height': 1}
+    with self.assertRaises(ValueError):
+      decode_layout(json.dumps(document).encode(), SCREEN)
+
+  def test_unsaved_layer_order_draws_the_editor_default(self):
+    document = default_layout(SCREEN)
+    self.assertNotIn('widgetOrder', document)
+    order = projection_customization(document, default_document())['widgetOrder']['large']
+    self.assertEqual(order, layout_metadata(SCREEN)['widgetOrder'])
+    self.assertLess(order.index(NAV_MAP), order.index('pip_right'))
+    saved = [NAV_MAP, *(key for key in order if key != NAV_MAP)][::-1]
+    self.assertEqual(projection_customization({**document, 'widgetOrder': saved}, default_document())['widgetOrder']['large'], saved)
+
   def test_sources_save_actual_attached_actions_inside_each_projection_screen(self):
     from openpilot.starpilot.ui.onroad_customization import default_document, placement
     for viewport in ((1860, 1080), (2880, 1080), (1920, 1440)):
