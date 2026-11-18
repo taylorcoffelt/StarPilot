@@ -30,6 +30,7 @@ from openpilot.starpilot.ui.onroad_curve import GlowPhase, controlling as curve_
 from openpilot.starpilot.ui.onroad_conditional import stop_active
 from openpilot.starpilot.ui.onroad_corner import CornerHintCache, render_corner_hint
 from openpilot.starpilot.ui.onroad_large_widgets import CurrentSpeedHud, UnifiedSpeedWidget, SteeringWheelWidget
+from openpilot.starpilot.ui.onroad_widget_style import draw_top_scrim
 from openpilot.starpilot.ui.onroad_cem_gauge import AetherGauge
 from openpilot.starpilot.ui.live_developer_sidebar import render_sidebar as render_live_sidebar
 from openpilot.starpilot.ui.layout_preview_sidebar import SIDEBAR_WIDTH
@@ -341,6 +342,7 @@ class OnroadView:
         if state.stopped_duration_s is not None:
           submit(STOPPED_TIMER_WIDGET, lambda: self._stopped_timer(state, state.stopped_duration_s))
     else:
+      submit("nav_card", lambda: self.navigation.render(state))
       if state.alert.size == AlertSize.NONE and not driver_camera:
         submit("speed_limit", lambda: self.compact_hud._speed_limit_sign(state))
         submit("max_speed", lambda: self.compact_hud.render_max_speed(state))
@@ -375,6 +377,9 @@ class OnroadView:
     if pending and (only_widget is None or only_widget == ('cruise_limits' if large else 'speed_limit')) and not driver_camera:
       self._slc_actions(state)
 
+  def _legacy_pip_layer(self, state):
+    return getattr(self, "pip_layer", None) if state.camera_available else getattr(self, "preview_pip_layer", None)
+
   def _large(self, state: OnroadState) -> None:
     width, height = self.projection_viewport or (state.viewport_width, 1080)
     right_shift = width - 1860
@@ -390,15 +395,13 @@ class OnroadView:
         self.camera_layer(content, state)
       elif self.background_layer is not None:
         self.background_layer(content, state)
+      draw_top_scrim(content)
       ordered = bool(state.customization.get("widgetOrder", {}).get("large"))
       if ordered:
         self._ordered_widgets(content, state)
         if self.extra_overlays is not None:
           self.extra_overlays(content, state)
       else:
-        pip_layer = getattr(self, "pip_layer", None)
-        if pip_layer is not None and state.camera_available:
-          pip_layer(content, state)
         map_layer = getattr(self, "map_layer", None)
         if map_layer is not None and state.alert.size != AlertSize.FULL:
           map_layer(content, state)
@@ -451,6 +454,8 @@ class OnroadView:
         quick_select(content, state)
       if not ordered and state.alert.size != AlertSize.FULL:
         render_rear_fog(state, "large")
+      if not ordered and (pip_layer := self._legacy_pip_layer(state)) is not None:
+        pip_layer(content, state)
       self.alert.render(content, state.alert)
     finally:
       clip.end_scissor_mode()
@@ -518,10 +523,6 @@ class OnroadView:
         if self.extra_overlays is not None:
           self.extra_overlays(frame, state)
       else:
-        pip_layer = getattr(self, "pip_layer", None)
-        if pip_layer is not None and state.camera_available and not driver_camera and \
-           state.appearance.camera_view != CameraViewChoice.NONE:
-          pip_layer(frame, state)
         self._prepare_compact_fade()
         rl.draw_texture_ex(self._fade, rl.Vector2(0, 0), 0, 1, rl.WHITE)
         if state.alert.size == AlertSize.NONE and not driver_camera:
@@ -536,8 +537,8 @@ class OnroadView:
           self.extra_overlays(frame, state)
         if monitor_layer := getattr(self, "driver_monitor_layer", None):
           monitor_layer(frame, state)
-      self.navigation.render(state)
       if not ordered:
+        self.navigation.render(state)
         self._driving_mode(state)
         self._clock(state)
         self._weather(state)
@@ -547,6 +548,9 @@ class OnroadView:
       direction = (-1 if signals.left_blinker else 1 if signals.right_blinker else 0) if signals else 0
       if not ordered and state.alert.size != AlertSize.FULL:
         render_rear_fog(state, "compact")
+      if not ordered and not driver_camera and state.appearance.camera_view != CameraViewChoice.NONE and \
+         (pip_layer := self._legacy_pip_layer(state)) is not None:
+        pip_layer(frame, state)
       self.alert.render(frame, state.alert, signal_direction=direction)
     finally:
       clip.end_scissor_mode()
@@ -597,6 +601,8 @@ class OnroadView:
     gui_app.remove_render_prepare(self.torque_bar.prepare)
     self.torque_bar.close()
     self.navigation.close()
+    if now_playing := getattr(self, "now_playing", None):
+      now_playing.close()
     if self.fonts.profile == Profile.LARGE:
       self.unified_speed.close()
       self.steering_wheel.close()

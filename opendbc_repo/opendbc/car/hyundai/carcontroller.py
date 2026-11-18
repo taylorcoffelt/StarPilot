@@ -44,6 +44,7 @@ from opendbc.car.vehicle_model import VehicleModel
 
 EV9_OP_LONG_ANGLE_TARGET_MAX = 140.0
 PE_OP_LONG_ANGLE_TARGET_MAX = 175.0
+DIRECT_ANGLE_MAX_RATE = 2.2
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -115,6 +116,7 @@ class CarController(CarControllerBase):
     self.CAN = CanBus(CP)
     self.params = CarControllerParams(CP)
     self.packer = CANPacker(dbc_names[Bus.pt])
+    self.legacy_fca11 = hyundaican.uses_legacy_fca11(CP)
     self.angle_limit_counter = 0
     self.angle_vm = VehicleModel(CP) if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING else None
     self.apply_angle_last = 0.0
@@ -162,6 +164,9 @@ class CarController(CarControllerBase):
     ioniq6_status = (self.ioniq6_longitudinal is not None and
                      int(CP.safetyConfigs[-1].safetyParam) in (0x8015, 0x8095, 0x8815, 0x8895))
     self.ioniq6_bsm_enabled = ioniq6_status
+    self.ioniq6_stock_aol_status = (CP.carFingerprint == CAR.HYUNDAI_IONIQ_6 and
+                                  not CP.openpilotLongitudinalControl and CP.pcmCruise and
+                                  int(CP.safetyConfigs[-1].safetyParam) in (0x0811, 0x0891))
     self.canfd_torque_aol_status = (qualified_canfd_stock_aol(CP) or qualified_canfd_long_aol(CP))
     self.canfd_dash_icons = CanFDDashIcons() if ioniq6_status or self.canfd_torque_aol_status else None
     self.classic_dash_icons = CanFDDashIcons() if classic_aol_dash_enabled(CP) else None
@@ -386,7 +391,7 @@ class CarController(CarControllerBase):
       use_fca = self.CP.flags & HyundaiFlags.USE_FCA.value
       can_sends.extend(hyundaican.create_acc_commands(self.packer, CC.enabled, accel, jerk, int(self.frame / 2),
                                                       hud_control, set_speed_in_units, stopping,
-                                                      CC.cruiseControl.override, use_fca, self.CP, lead_data=lead_data))
+                                                      CC.cruiseControl.override, use_fca, self.CP, lead_data=lead_data, legacy_fca11=self.legacy_fca11))
 
     # 20 Hz LFA MFA message
     if self.frame % 5 == 0 and (self.CP.flags & HyundaiFlags.SEND_LFA.value or
@@ -412,6 +417,7 @@ class CarController(CarControllerBase):
   def create_canfd_msgs(self, apply_steer_req, apply_torque, set_speed_in_units, accel, stopping, hud_control, CS, CC, now_nanos):
     _projection = self.learning_projection_observer
     can_sends = []
+    stock_popup_owned = False
     canfd_lfa_icon = (self.canfd_dash_icons.update(self.frame, CC.enabled, CC.latActive)
                        if self.canfd_dash_icons is not None else None)
 
@@ -469,7 +475,7 @@ class CarController(CarControllerBase):
                                          active, self.params, self.ev9_legacy_envelope)
       if active:
         delta = min(get_max_angle_delta_vm(safety_speed, self.ev9_legacy_envelope, self.params),
-                    self.params.ANGLE_LIMITS.MAX_ANGLE_RATE)
+                    self.params.ANGLE_LIMITS.MAX_ANGLE_RATE, DIRECT_ANGLE_MAX_RATE)
         angle = float(np.clip(angle, self.apply_angle_last - delta, self.apply_angle_last + delta))
       # Exact typed EV9 safety envelope is an additional bound, not a new tune.
       self.apply_angle_last = apply_steer_angle_limits_vm(angle, self.apply_angle_last, safety_speed, measured,
@@ -527,16 +533,27 @@ class CarController(CarControllerBase):
     else:
       steering_status_active = CC.enabled
       if ((self.CP.carFingerprint == CAR.KIA_CARNIVAL_2025 and self.CP.safetyConfigs[-1].safetyParam == 0x28B4) or
-          self.canfd_torque_aol_status or (self.ioniq6_longitudinal is not None and
+          self.ioniq6_stock_aol_status or self.canfd_torque_aol_status or (self.ioniq6_longitudinal is not None and
                                  self.CP.safetyConfigs[-1].safetyParam in (0x8815, 0x8895))):
         # AOL may steer while ordinary cruise engagement remains off.
         steering_status_active |= CC.latActive
       stock_source = getattr(CS, "stock_lfa_status", None)
       stock_lfa = stock_source.current(clock_boot_ns()) if stock_source is not None else None
       stock_faults = stock_source.last_fault() if stock_source is not None and stock_lfa is None else None
+      stock_owned_status = False
+      if stock_source is not None:
+        display_healthy = CS.out.canValid and not (CS.out.canTimeout or CS.out.steerFaultTemporary or
+                                                   CS.out.steerFaultPermanent or CS.out.accFaulted)
+        stock_owned_status = stock_source.owns_display_status(apply_steer_req, clock_boot_ns(), healthy=display_healthy)
+        stock_popup_owned = stock_source.owns_disengage_popup(apply_steer_req, clock_boot_ns(), healthy=display_healthy,
+                                                            qualified_warning=stock_owned_status)
+      damping_source = getattr(CS, "stock_lkas_damping", None)
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN,
                                                             steering_status_active, apply_steer_req, apply_torque,
-                                                            stock_lfa=stock_lfa, stock_lfa_faults=stock_faults))
+                                                            stock_lfa=stock_lfa, stock_lfa_faults=stock_faults,
+                                                            stock_lfa_owned_status=stock_owned_status,
+                                                            stock_lkas_damping=(damping_source.current_damping(clock_boot_ns())
+                                                              if damping_source is not None else None)))
       if _projection is not None:
         _projection.emit('hyundai.CANFD_TORQUE', apply_torque, apply_steer_req, can_sends[-1])
 
@@ -575,7 +592,7 @@ class CarController(CarControllerBase):
         cluster_source = getattr(CS, "stock_cluster_status", None)
         stock_cluster = cluster_source.current(clock_boot_ns()) if cluster_source is not None else None
         can_sends.append(hyundaicanfd.create_lfahda_cluster(self.packer, self.CAN, CC.enabled, lfa_icon=canfd_lfa_icon,
-                                                         stock_cluster=stock_cluster))
+                                                         stock_cluster=stock_cluster, owned_lfa_status=stock_popup_owned))
 
     # blinkers
     if lka_steering and self.CP.flags & HyundaiFlags.CANFD_ENABLE_BLINKERS:

@@ -4,7 +4,7 @@ A stored proposal is explicitly provisional. It never means live confirmation,
 a native permission, physical causal proof, or a thirty-parameter identification.
 """
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import math
@@ -14,19 +14,21 @@ from typing import Any
 
 from openpilot.starpilot.flm.offroad_surface import ROUTE_NAMES as NAMES
 from openpilot.starpilot.flm.learned_lifecycle import decode
-from openpilot.starpilot.flm.offroad_cache import AssessmentCache, MAX_CHECKPOINTS
+from openpilot.starpilot.flm.offroad_cache import AssessmentCache, MAX_CHECKPOINTS, trial_origin, trial_document
 from openpilot.starpilot.flm.offroad_checks import qualify
 from openpilot.starpilot.flm.offroad_processor import analyze_latest, CompletedAssessment
-from openpilot.starpilot.flm.offroad_route import latest_route, LOCAL_ID, MAX_SEGMENTS
-from openpilot.starpilot.flm.offroad_runtime import configuration_scope
-from openpilot.starpilot.flm.offroad_store import RouteStorage, KEY, MAX_BYTES, MAX_ROUTE_STEP, NAMESPACE
-from openpilot.starpilot.flm.offroad_surface import REVISION
+from openpilot.starpilot.flm.offroad_route import latest_route, logger_marker, route_inventory, source_revisions, RouteInputError, LOCAL_ID
+from openpilot.starpilot.flm.offroad_runtime import current_configuration as _current_configuration, VehicleIdentityUnavailable
+from openpilot.starpilot.flm.offroad_store import RouteScope, RouteStorage, KEY, MAX_BYTES, MAX_ROUTE_STEP, NAMESPACE
+from openpilot.starpilot.flm.offroad_surface import REVISION, current_revision, revision_for_manual
 from openpilot.starpilot.flm.offroad_tracking import TrackingEstimate, compare_observed
 from openpilot.starpilot.saved_source import read_saved
+from openpilot.starpilot.flm.log_decode import LogDecodeCancelled
+from openpilot.starpilot.flm.offroad_route import RouteInputCancelled
 
 POLICY = 'bounded_provisional_next_drive_v1'
 RECORDED_ASSESSOR = analyze_latest
-MAX_INCONCLUSIVE_DRIVES = 3
+MAX_TRIAL_SEGMENTS = 4096
 ZERO = dict.fromkeys(NAMES, 0.0)
 from openpilot.starpilot.lateral.torque_settings import DOCUMENT_KEY, LEGACY_KEYS
 
@@ -52,25 +54,30 @@ def _digest(value):
   return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
-def _current_configuration(cp, params):
-  from opendbc.car.car_helpers import interfaces
-  from openpilot.starpilot.lateral.controller_selection import read_selection
-  from openpilot.starpilot.flm.controller_replay import SelectedControllerFactory
-  from openpilot.starpilot.flm.pid_controller_replay import PidControllerFactory
-  from openpilot.starpilot.vehicle_preferences import VehicleStartupPreferences
+def _assessment_source_revision():
+  """Invalidate old results when the controller or native replay changes too."""
+  from opendbc import car
+  from openpilot.starpilot.flm.native_primitives import native_identity
 
-  startup = VehicleStartupPreferences.read(params, enabled=params.get_bool('OpenpilotEnabledToggle'))
-  mode = 'native' if cp.lateralTuning.which() == 'pid' else str(read_selection(params, cp).mode)
-  factory = PidControllerFactory(cp, mode) if cp.lateralTuning.which() == 'pid' else SelectedControllerFactory(cp, mode, turn_assist=startup.turn_assist)
-  controller, _ = factory.create()
-  ci = interfaces[str(cp.carFingerprint)](cp)
-  from openpilot.starpilot.flm.runtime_adapter_registry import selected_descriptor
+  here = Path(__file__).resolve()
+  car_root = Path(car.__file__).resolve().parent
+  roots = (here.parent, here.parents[1] / 'lateral', here.parents[2] / 'common',
+           here.parents[2] / 'selfdrive/controls/lib', car_root,
+           *(path for path in car_root.iterdir() if path.is_dir() and path.name != 'tests'))
+  files = sorted({path for root in roots for path in root.glob('*.py')})
+  if not files or len(files) > 2048:
+    raise ValueError('Bounded assessment implementation sources required')
+  hashes = []
+  for path in files:
+    raw = path.read_bytes()
+    if len(raw) > 2 * 1024 * 1024:
+      raise ValueError('Assessment implementation source bound')
+    hashes.append((str(path), hashlib.sha256(raw).hexdigest()))
+  receipt = here.parents[3] / 'prebuilt.json'
+  binding = hashlib.sha256(receipt.read_bytes()).hexdigest() if receipt.is_file() else None
+  return _digest((hashes, native_identity(), binding))
 
-  scope, numeric = configuration_scope(cp, ci, controller, params, manual_status='not_configured')
-  descriptor = selected_descriptor(cp, ci, controller)
-  if descriptor is None:
-    raise ValueError('Current registered controller required')
-  return scope, descriptor, numeric
+
 
 
 def _current_scope(cp, params):
@@ -78,6 +85,11 @@ def _current_scope(cp, params):
 
 
 def recorded_source_contract(cp, metadata, scope, params):
+  from openpilot.starpilot.flm.manual_coordinates import selected_manual
+  expected_revision = revision_for_manual(selected_manual(cp, params))
+  recorded_revision = metadata.get('route_revision', '')
+  if (recorded_revision and recorded_revision != expected_revision) or (not recorded_revision and expected_revision != REVISION):
+    return None
   if metadata['route_scope'] == scope.key():
     return {'kind': 'same_recorded_scope', 'current_scope': scope.key()}
   if not metadata['route_scope']:
@@ -115,7 +127,7 @@ def _recorded_values(metadata):
   pairs = metadata['route_values']
   if not pairs:
     return dict(ZERO) if not metadata['route_revision'] else None
-  if metadata['route_revision'] != REVISION or tuple(n for n, _ in pairs) != tuple(NAMES):
+  if not current_revision(metadata['route_revision']) or tuple(n for n, _ in pairs) != tuple(NAMES):
     return None
   return dict(pairs)
 
@@ -134,15 +146,64 @@ def _est(value):
   return TrackingEstimate(**value)
 
 
-def trial_document(cache, digest):
+
+
+
+
+def rejected_trial_change(cache, row, proposal):
+  """A historical inconclusive timeout is not measured rejection of a tune."""
+  if row is None or row['state'] != 'rolled_back':
+    return False
+  outcome = cache.get(row['analysis_sha256'])
+  comparisons = outcome.get('comparisons')
+  timeout = (
+    outcome.get('kind') == 'next_drive_outcome'
+    and outcome.get('outcome') == 'rolled_back'
+    and outcome.get('reason') == 'trial_inconclusive_drive_limit'
+    and outcome.get('observed_only') is True
+    and type(comparisons) is list
+    and type(outcome.get('assessment')) is dict
+    and not outcome['assessment'].get('quality_stop_markers')
+    and all(
+      type(comparison) is dict and type(comparison.get('independent')) is list and len(comparison['independent']) == 2
+      and all(type(result) is dict and result.get('worse') is False for result in comparison['independent'])
+      for comparison in comparisons
+    )
+  )
+  if timeout:
+    return False  # Fresh independent/native qualification still runs below; no old value is restored here.
+  trial = trial_document(cache, row['analysis_sha256'])
+  return trial['parameter'] == proposal['parameter'] and trial['delta'] == proposal['delta']
+
+
+def trial_source_history(cache, digest):
+  from openpilot.starpilot.flm.offroad_route import original_segment_hashes
+
+  segments = set()
+  complete = True
   for _ in range(8):
-    value = cache.get(digest)
-    if value.get('kind') == 'next_drive_trial':
-      return value
-    if value.get('kind') != 'next_drive_outcome':
+    document = cache.get(digest)
+    if 'trial_source_segments' in document:
+      saved = document['trial_source_segments']
+      if (type(saved) is not list or len(saved) > MAX_TRIAL_SEGMENTS
+          or any(type(s) is not str or len(s) != 64 or s.strip('0123456789abcdef') for s in saved) or len(set(saved)) != len(saved)
+          or type(document.get('trial_source_history_complete')) is not bool):
+        raise ValueError('Exact retained trial source history required')
+      segments.update(saved)
+      complete &= document['trial_source_history_complete']
+    assessment = document.get('assessment', {})
+    for receipt in (assessment.get('route', {}), *assessment.get('evidence_sources', ())):
+      segments.update(original_segment_hashes(receipt.get('segments', ())))
+    if document.get('kind') == 'next_drive_trial':
+      return segments, complete
+    if document.get('kind') != 'next_drive_outcome':
       break
-    digest = value['trial_analysis_sha256']
-  raise ValueError('Bounded original next-drive trial lineage required')
+    digest = document['trial_analysis_sha256']
+  raise ValueError('Bounded original next-drive source history required')
+
+
+def trial_segment_history(cache, digest):
+  return trial_source_history(cache, digest)[0]
 
 
 def quality_withdrawn(assessment, scope, values):
@@ -152,30 +213,50 @@ def quality_withdrawn(assessment, scope, values):
   return any(stop_marker(scope.key(), values, r) in reasons for r in STOP_REASONS)
 
 
-def pending_routes(root, latest):
+def pending_routes(root, latest, *, on_skip=None):
   """Review the eight most recent logger inputs, newest first; no fit selection."""
-  if not LOCAL_ID.fullmatch(latest['routeId']):
-    return [latest]
-  from openpilot.starpilot.galaxy.drive_history import DriveHistory
-
-  inventory = DriveHistory(root, max_segments_per_route=MAX_SEGMENTS).snapshot()
-  if inventory['scanIncomplete']:
-    raise ValueError('Completed-drive backlog inventory incomplete')
-  counter = int(latest['routeId'].split('--')[0], 16)
+  name = latest['routeId']
+  if type(name) is not str or not LOCAL_ID.fullmatch(name):
+    if type(latest.get('loggerCounter')) is not int:
+      return [latest]
+    counter = latest['loggerCounter']
+  else:
+    counter = int(name.split('--')[0], 16)
+  inventory = route_inventory(root)
+  if on_skip is not None:
+    for row in inventory.get('routeErrors', ()):
+      if LOCAL_ID.fullmatch(row['routeId']) and (counter - int(row['routeId'].split('--')[0], 16)) % 2**32 < MAX_CHECKPOINTS:
+        on_skip(row['routeId'], row['reason'])
   candidates = []
+  for error in inventory.get('routeErrors', ()):
+    if LOCAL_ID.fullmatch(error['routeId']):
+      distance = (counter - int(error['routeId'].split('--')[0], 16)) % 2**32
+      if 1 <= distance < MAX_CHECKPOINTS:
+        candidates.append((distance, error['routeId'], {'routeId': error['routeId'], 'segments': [], 'selection_error': error['reason']}))
   for route in inventory['routes']:
     if not LOCAL_ID.fullmatch(route['routeId']):
       continue
     distance = (counter - int(route['routeId'].split('--')[0], 16)) % 2**32
-    if 1 <= distance < MAX_CHECKPOINTS and route.get('segments') and all(s['files']['rlog'] for s in route['segments']):
-      candidates.append((distance, route['routeId'], route))
-  if len({distance for distance, _, _ in candidates}) != len(candidates):
-    raise ValueError('Ambiguous completed logger counter')
-  return [latest] + [route for _, _, route in sorted(candidates)]
+    if 1 <= distance < MAX_CHECKPOINTS:
+      if route.get('segments') and all(s['files']['rlog'] for s in route['segments']):
+        candidates.append((distance, route['routeId'], route))
+      elif on_skip is not None:
+        on_skip(route['routeId'], 'Original dense recording is incomplete')
+  ambiguous = {distance for distance, _, _ in candidates if sum(row[0] == distance for row in candidates) > 1}
+  if on_skip is not None:
+    for distance, name, _ in candidates:
+      if distance in ambiguous:
+        on_skip(name, 'Ambiguous logger counter')
+  return [latest] + [route for distance, _, route in sorted(candidates) if distance not in ambiguous]
 
 
-def assess_next_drive(trial, assessment, scope, *, trial_started=True, recorded_backlog=False):
+def assess_next_drive(trial, assessment, scope, *, trial_started=True, recorded_backlog=False, previous_segments=()):
   """Compare independently held-out actual observations; no raw-RMS reward."""
+  from openpilot.starpilot.flm.offroad_route import PartialRouteReceipt
+
+  if type(getattr(assessment, 'receipt', None)) is PartialRouteReceipt:
+    return {'outcome': 'pending', 'reason': 'partial_drive_provisional_only', 'counts_as_new_drive': False,
+            'observed_only': True, 'causal_road_benefit_proven': False, 'comparisons': []}
   if trial.get('policy') != POLICY or trial.get('kind') != 'next_drive_trial':
     raise ValueError('Exact provisional assessment provenance required')
   if quality_withdrawn(assessment, scope, trial['values']):
@@ -202,6 +283,13 @@ def assess_next_drive(trial, assessment, scope, *, trial_started=True, recorded_
         'outcome': 'pending', 'reason': 'recorded_drive_precedes_trial_configuration',
         'counts_as_new_drive': False, 'observed_only': True, 'causal_road_benefit_proven': False, 'comparisons': [],
       }
+  from openpilot.starpilot.flm.offroad_route import original_segment_hashes
+
+  if previous_segments and set(previous_segments).intersection(original_segment_hashes(assessment.receipt.segments)):
+    return {
+      'outcome': 'pending', 'reason': 'recording_repeats_previous_trial_evidence',
+      'counts_as_new_drive': False, 'observed_only': True, 'causal_road_benefit_proven': False, 'comparisons': [],
+    }
   before = trial['original_metadata']
   comparisons = []
   stable = trial['before']['training'].get('kind') == 'uncommanded_residual_v1'
@@ -271,6 +359,27 @@ def assess_next_drive(trial, assessment, scope, *, trial_started=True, recorded_
   }
 
 
+def neutral_native_review(outcome, checks):
+  """A comparable, verified drive can finish a review without proving benefit.
+
+  Missing comparisons and mere elapsed drives never count. The original
+  regression predicates and both actual-map/prior-map native checks remain
+  required; the worker separately deduplicates original recording bytes.
+  """
+  comparisons = outcome.get('comparisons', ())
+  if outcome['outcome'] != 'pending' or not comparisons or not checks or not all(r['qualified'] for r in checks):
+    return False
+  if any(type(c.get('independent')) is not list or len(c['independent']) != 2 for c in comparisons):
+    return False
+  return all(
+    r.get('worse') is False and r.get('input_standardized') is True and r.get('residual_input_comparable') is True
+    and (r.get('no_smoothness_regression') is True if r.get('kind') == 'uncommanded_residual_v1' else
+         r.get('fit_supported') is True and all(r.get(key) is True for key in
+           ('no_oscillation_regression', 'no_overshoot_regression', 'no_peak_error_regression')))
+    for comparison in comparisons for r in comparison['independent']
+  )
+
+
 def recorded_recommendations(assessment, previous, report):
   """Publish original candidates independently of automatic qualification.
 
@@ -282,12 +391,12 @@ def recorded_recommendations(assessment, previous, report):
 
   found: dict[str, dict[str, Any]] = {}
 
-  def add(proposal, windows, reason, baseline=None):
+  def add(proposal, windows, reason, baseline=None, feedback=()):
     baseline = previous if baseline is None else baseline
     if type(proposal) is not dict or type(windows) is not int or windows <= 0:
       return
     symptoms = proposal.get('symptoms', ())
-    if len(symptoms) == 1 and len(symptoms[0]) == 2:
+    if len(symptoms) == 1 and len(symptoms[0]) == 2 and reason != 'heldout_profile_does_not_support_training_step':
       reason = 'observed_' + '_'.join(symptoms[0])
     values = proposal.get('values')
     if type(values) is not dict:
@@ -310,29 +419,45 @@ def recorded_recommendations(assessment, previous, report):
       low, high = route_bounds(name)
       if not low <= target <= high or not 1e-12 < abs(target - base) <= MAX_ROUTE_STEP + 1e-12:
         continue
+      coordinate_reason = next((r['reason'] for r in feedback if r['parameter'] == name and abs(r['target'] - target) <= 1e-12), reason)
+      if coordinate_reason == 'conflicting_recorded_candidates':
+        target = None
       if name in found:
         row = found[name]
-        row['whole_windows'] = max(windows, row['whole_windows'])
-        if row['target'] is None or abs(row['target'] - target) > 1e-12:
+        if row['target'] is None or target is None or (row['target'] - base) * (target - base) < 0:
           row.update(target=None, reason='conflicting_recorded_candidates')
+        elif abs(target - base) < abs(row['target'] - base) - 1e-12:
+          row.update(target=target, whole_windows=windows, reason=coordinate_reason)
+        elif abs(row['target'] - target) <= 1e-12:
+          row['whole_windows'] = max(windows, row['whole_windows'])
+          if coordinate_reason in ('heldout_profile_does_not_support_training_step', 'independent_support_for_frozen_training_profile'):
+            row['reason'] = coordinate_reason
       else:
-        found[name] = {'parameter': name, 'baseline': base, 'target': target, 'whole_windows': windows, 'reason': reason}
+        found[name] = {'parameter': name, 'baseline': base, 'target': target, 'whole_windows': windows, 'reason': coordinate_reason}
 
   for group in (*assessment.groups, *assessment.diagnostic_groups):
     for cohort in group['cohorts']:
       baseline = _recorded_values(group['original_metadata']) if 'original_metadata' in group else previous
       if baseline is not None:
         add(cohort.get('proposal'), cohort.get('whole_windows', 0), 'recorded_candidate_requires_automatic_checks', baseline)
+        add(cohort.get('provisional_proposal'), cohort.get('whole_windows', 0), 'recorded_provisional_suggestion', baseline)
+        for candidate in cohort.get('provisional_coordinate_candidates', ()):
+          add(candidate, len(candidate['original_windows']), 'recorded_provisional_suggestion', baseline)
   for proof in (*report.get('stable_profile_reports', ()), *report.get('short_turn_profile_reports', ())):
     roles = proof.get('roles', {})
     windows = sum(len(roles.get(role, {}).get('original_windows', ())) for role in ('training', 'heldout'))
-    add(proof.get('frozen_training_profile'), windows, proof.get('reason', 'recorded_candidate_requires_automatic_checks'))
+    feedback = proof.get('coordinate_review', ())
+    add(proof.get('frozen_training_profile'), windows, proof.get('reason', 'recorded_candidate_requires_automatic_checks'), feedback=feedback)
     add(proof.get('observed_candidate'), windows, 'recorded_candidate_not_independently_confirmed')
     for proposal in roles.get('training', {}).get('coordinate_candidates', ()):
-      add(proposal, windows, 'training_candidate_not_independently_confirmed')
+      add(proposal, windows, 'training_candidate_not_independently_confirmed', feedback=feedback)
   for proof in report.get('observed_profile_reports', ()):
     for proposal in proof.get('coordinate_candidates', ()):
-      add(proposal, len(proof['original_windows']), 'recorded_candidate_not_independently_confirmed', proof.get('source_baseline'))
+      add(proposal, len(proposal.get('original_windows', proof['original_windows'])),
+          'recorded_candidate_not_independently_confirmed', proof.get('source_baseline'))
+  for name in report.get('refused_parameters', ()):
+    if name in found and found[name]['target'] is not None:
+      found[name]['reason'] = 'controller_checks_did_not_support_change'
   return [found[name] for name in NAMES if name in found]
 
 
@@ -375,6 +500,173 @@ def _input_spans(group, cohort, ids):
   }
 
 
+def newer_original_refusal(cache, receipt, scope, values):
+  """An older replay cannot overrule the same change failing on newer driving."""
+  for row in reversed(cache.checkpoints()):
+    result = row['result']
+    if (result.get('reason') != 'original_controller_or_registered_encoder_check_refused'
+        or result.get('suggestion', {}).get('values') != values):
+      continue
+    document = cache.get(result['assessment_sha256'])
+    assessment = document['assessment']
+    source = assessment['route']
+    if (document['kind'] != 'completed_assessment' or source['route_id'] != result['completed_route']
+        or source['source_sha256'] != result['source_sha256']):
+      raise ValueError('Original refused assessment source changed')
+    if (RouteScope(**assessment['current_scope']).validate() == scope
+        and assessment.get('all_original_window_checks', {}).get('qualified') is False
+        and source['completed_wall_ns'] >= receipt.completed_wall_ns):
+      return {'completed_route': source['route_id'], 'assessment_sha256': result['assessment_sha256']}
+  return None
+
+
+def recent_findings(cache, results, display):
+  """Keep compatible provisional findings; never merge save decisions or evidence counts."""
+  from openpilot.starpilot.flm.offroad_surface import route_bounds, route_values
+
+  latest = results[0]
+  if latest.get('status') not in ('collecting', 'ready_for_next_drive', 'accepted_after_drive', 'retained_after_drive', 'rolled_back'):
+    return display
+
+  def source(value):
+    document = cache.get(value['assessment_sha256'])
+    assessment = document['assessment']
+    receipt = assessment['route']
+    if (document['kind'] not in ('completed_assessment', 'partial_assessment')
+        or document['kind'] == 'partial_assessment' and value.get('partial_drive') is not True
+        or receipt['route_id'] != value['completed_route'] or receipt['source_sha256'] != value['source_sha256']):
+      raise ValueError('Source-bound recent findings required')
+    scope = RouteScope(**assessment['current_scope']).validate()
+    if receipt['cp_sha256'] != scope.cp_sha256:
+      raise ValueError('Recent finding vehicle identity changed')
+    partial = document['kind'] == 'partial_assessment'
+    stamp = receipt.get('last_intact_wall_ns') if partial else receipt.get('completed_wall_ns')
+    if type(stamp) is not int or stamp <= 0:
+      raise ValueError('Original recent-drive chronology required')
+    return scope, partial, stamp
+
+  try:
+    current_scope, _, _ = source(latest)
+    current = route_values(latest['configured_values']) if 'configured_values' in latest else (
+      ZERO if latest.get('saved_adjustments') == 0 else None
+    )
+  except (KeyError, OSError, TypeError, ValueError):
+    return display
+  if current is None:
+    return display
+  compatible = []
+  for index, value in enumerate(results[:MAX_CHECKPOINTS + 1]):
+    try:
+      scope, partial, stamp = source(value)
+    except (KeyError, OSError, TypeError, ValueError):
+      continue
+    if scope == current_scope:
+      compatible.append((stamp, index, partial, value))
+  found, origins, blocked, seen = {}, {}, set(), set()
+  for _, _, partial, value in sorted(compatible, key=lambda row: (-row[0], row[1])):
+    if value['source_sha256'] in seen:
+      continue
+    if len(seen) >= MAX_CHECKPOINTS:
+      break
+    seen.add(value['source_sha256'])
+    recommendations = value.get('recommendations', ())
+    if type(recommendations) not in (list, tuple):
+      continue
+    for row in recommendations:
+      if type(row) is not dict:
+        continue
+      name = row.get('parameter')
+      if (name not in NAMES or name in latest.get('manual_locked_parameters', ())
+          or type(row.get('baseline')) not in (int, float) or row['baseline'] != current[name]
+          or type(row.get('reason')) is not str or len(row['reason']) > 240):
+        continue
+      target = row.get('target')
+      if target is None or row.get('reason') in (
+        'conflicting_recorded_candidates', 'heldout_profile_does_not_support_training_step', 'controller_checks_did_not_support_change'
+      ):
+        blocked.add(name)
+        continue
+      low, high = route_bounds(name)
+      if (type(target) not in (int, float) or not math.isfinite(target) or not low <= target <= high
+          or not 1e-12 < abs(target - current[name]) <= MAX_ROUTE_STEP + 1e-12
+          or type(row.get('whole_windows')) is not int or not 0 < row['whole_windows'] < 2**63):
+        continue
+      if name in found and (found[name]['target'] - current[name]) * (target - current[name]) < 0:
+        blocked.add(name)
+      elif name not in found:
+        found[name] = dict(row, reason='partial_drive_provisional_only') if partial else dict(row)
+        origins[name] = value['completed_route']
+  rows = [found[name] for name in NAMES if name in found and name not in blocked]
+  if rows == display.get('recommendations', []) and all(origins[row['parameter']] == display.get('completed_route') for row in rows):
+    return display
+  return dict(display, recommendations=rows, recommendation_count=len(rows),
+              recommendation_sources=[[row['parameter'], origins[row['parameter']]] for row in rows])
+
+
+def reported_checkpoint(cache, results):
+  """Display useful current-profile evidence without changing any saved decision."""
+  skipped = [row for row in results if row.get('route_skipped') is True]
+  usable = [row for row in results if row.get('route_skipped') is not True]
+  if skipped:
+    value: dict[str, Any] = dict(reported_checkpoint(cache, usable), source_is_latest=False) if usable else dict(results[0])
+    faults = []
+    for row in skipped:
+      for fault in row.get('skipped_routes', ()):
+        if fault not in faults and len(faults) < 16:
+          faults.append(fault)
+    value['skipped_routes'] = faults
+    return value
+  latest = results[0]
+
+  def has_windows(value):
+    counts = value.get('analysis_counts', {})
+    return type(counts) is dict and any(type(counts.get(key)) is int and counts[key] > 0
+               for key in ('qualified_whole_windows', 'stable_qualified_whole_windows', 'diagnostic_whole_windows'))
+
+  def scope(value):
+    document = cache.get(value['assessment_sha256'])
+    assessment = document['assessment']
+    source = assessment['route']
+    if (document['kind'] != 'completed_assessment' or source['route_id'] != value['completed_route']
+        or source['source_sha256'] != value['source_sha256']):
+      raise ValueError('Source-bound completed assessment required for retained findings')
+    return RouteScope(**assessment['current_scope']).validate()
+
+  if (latest.get('status') != 'collecting' or latest.get('reason') != 'more_independent_eligible_tracking_required'
+      or has_windows(latest)):
+    return recent_findings(cache, results, latest)
+  try:
+    current_scope = scope(latest)
+  except (KeyError, OSError, TypeError, ValueError):
+    return latest
+  compatible = []
+  for candidate in results:
+    try:
+      if candidate.get('status') == 'collecting' and scope(candidate) == current_scope:
+        compatible.append(candidate)
+    except (KeyError, OSError, TypeError, ValueError):
+      continue
+  # Recording order and input coverage choose the report, never fit quality or approval.
+  retained = next((value for value in compatible if has_windows(value)), None)
+  if retained is None:
+    return recent_findings(cache, results, latest)
+  value = dict(latest)
+  for key in ('completed_route', 'vehicle', 'analysis_counts', 'recorded_tracking', 'source_sha256', 'assessment_sha256',
+              'recommendations', 'suggestions', 'suggestion_count', 'qualification_summary'):
+    if key in retained:
+      value[key] = retained[key]
+    else:
+      value.pop(key, None)
+  value['analysis_counts'] = dict(value['analysis_counts'])
+  for key in ('evidence_drives', 'evidence_windows'):
+    counts = [r.get('analysis_counts', {}).get(key, 0) for r in compatible if type(r.get('analysis_counts')) is dict]
+    value['analysis_counts'][key] = max((n for n in counts if type(n) is int and 0 <= n < 2**63), default=0)
+  value['source_is_latest'] = False
+  value['retained_decision'] = retained['reason']
+  value['latest_recording'] = {key: latest[key] for key in ('completed_route', 'reason', 'analysis_counts')}
+  return recent_findings(cache, results, value)  # Save, application and rollback fields stay with the latest assessment.
+
+
 class OffroadWorker:
   def __init__(
     self,
@@ -395,9 +687,11 @@ class OffroadWorker:
     self.params, self.root = params, log_root
     self.cache = cache if isinstance(cache, AssessmentCache) else AssessmentCache(cache)
     self.permitted, self.assessor, self.checker, self.scope_for = permitted, assessor, checker, scope_for
-    self.source_revision = _digest([(p.name, hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(Path(__file__).parent.glob('*.py'))])
+    self.source_revision = _assessment_source_revision()
     self.pending_input = None
     self.pending_latest = None
+    self.pending_logger = None
+    self.skipped_routes = []
     self.pending_failure_data = None
     self.on_analysis = on_analysis
     self.on_assessment = on_assessment
@@ -411,6 +705,10 @@ class OffroadWorker:
       self.evidence_bank = EvidenceBank(self.cache.directory)
 
   def _history_identity(self, cp):
+    try:
+      scope = self.scope_for(cp, self.params)
+    except VehicleIdentityUnavailable:
+      return None
     settings = []
     for key in SETTINGS:
       if key == KEY:
@@ -419,7 +717,7 @@ class OffroadWorker:
       if not okay:
         raise ValueError('Unreadable evidence history setting')
       settings.append((key, None if raw is None else hashlib.sha256(raw).hexdigest()))
-    return _digest((self.scope_for(cp, self.params).document(), settings))
+    return _digest((scope.document(), settings))
 
   def _snapshot(self, route):
     values = []
@@ -428,18 +726,36 @@ class OffroadWorker:
       if not okay:
         raise ValueError('Unreadable automatic tuning setting')
       values.append((key, None if raw is None else hashlib.sha256(raw).hexdigest()))
-    return _digest((POLICY, self.source_revision, route, values))
+    return _digest((POLICY, self.source_revision, route, source_revisions(self.root, route), values))
+
+  def _skip_route(self, route_id, reason):
+    fault = [route_id or 'Last local recording', str(reason)[:160]]
+    if fault not in self.skipped_routes and len(self.skipped_routes) < 16:
+      self.skipped_routes.append(fault)
 
   def record_failure(self, error):
     # Preserve a failed immutable input without re-decoding it every poll.
     # Settings/source/code changes create a different fingerprint. Onroad
     # cancellation never marks a new drive completed or writes a tune.
     pending, self.pending_failure_data = self.pending_failure_data, None
-    if self.pending_input is None or not self.permitted():
+    if self.pending_input is None or isinstance(error, (RouteInputCancelled, LogDecodeCancelled)) or not self.permitted():
       return
     route, fingerprint = self.pending_input
-    if self._snapshot(route) != fingerprint or latest_route(self.params, self.root, permitted=self.permitted) != self.pending_latest:
+    if (self._snapshot(route) != fingerprint or logger_marker(self.params) != self.pending_logger
+        or latest_route(self.params, self.root, permitted=self.permitted, inventory_only=True) != self.pending_latest):
       return
+    if isinstance(error, RouteInputError):
+      self._skip_route(error.route_id, error)
+      if self.evidence_bank is not None:
+        try:
+          self.evidence_bank.exclude((error.route_id,), permitted=self.permitted)
+        except RouteInputCancelled:
+          return
+        except (OSError, ValueError) as history_error:
+          self._skip_route('Stored steering history', history_error)
+      if error.route_id is not None and error.route_id != route['routeId']:
+        return {'status': 'collecting', 'reason': 'skipped_unreadable_historical_drive', 'skipped_routes': list(self.skipped_routes),
+                'configuration_changed': False, 'actual_application_proven': False}
     result = {
       'status': 'unavailable',
       'reason': str(error)[:300],
@@ -447,68 +763,122 @@ class OffroadWorker:
       'actual_application_proven': False,
       'road_improvement_confirmed': False,
       'source_is_latest': route == self.pending_latest,
+      'route_skipped': isinstance(error, RouteInputError),
+      'skipped_routes': list(self.skipped_routes),
     }
-    if pending is not None:
+    if pending is not None and not isinstance(error, RouteInputError):
       authorized, recorded = pending
       if not authorized():
         return
       result.update(recorded)
+    if self.evidence_bank is not None:
+      result['evidence_revision'] = self.evidence_bank.revision()
     self.cache.checkpoint({'input_fingerprint': fingerprint, 'result': result})
     return result
 
   def run_once(self):
     self.pending_failure_data = None
     self.pending_input = None
+    self.skipped_routes = []
     if not self.permitted():
       raise ValueError('Offroad analysis not permitted')
-    latest = latest_route(self.params, self.root, permitted=self.permitted)
+    saved, readable = read_saved(self.params, KEY, MAX_BYTES)
+    if not readable:
+      raise ValueError('Unreadable automatic tuning history')
+    protected = [row['analysis_sha256'] for row in decode(saved).get(NAMESPACE, {}).values()]
+    self.cache.retire(protected, authorized=lambda: self.permitted() and read_saved(self.params, KEY, MAX_BYTES) == (saved, True))
+    self.pending_logger = logger_marker(self.params)
+    latest = latest_route(self.params, self.root, permitted=self.permitted, inventory_only=True, on_skip=self._skip_route)
+    if logger_marker(self.params) != self.pending_logger:
+      raise ValueError('Logger identity changed during route selection')
     self.pending_latest = latest
     checkpoints = {row['input_fingerprint']: row['result'] for row in self.cache.checkpoints()}
     fingerprints = []
-    for route in pending_routes(self.root, latest):
+    for route in pending_routes(self.root, latest, on_skip=self._skip_route):
       fingerprint = self._snapshot(route)
       fingerprints.append(fingerprint)
-      if fingerprint not in checkpoints:
+      if (fingerprint not in checkpoints or self.evidence_bank is not None and route == latest
+          and not checkpoints[fingerprint].get('route_skipped') and not checkpoints[fingerprint].get('partial_drive')
+          and checkpoints[fingerprint].get('evidence_revision') != self.evidence_bank.revision()):
         break
     else:
-      last = self.cache.latest()
-      result = checkpoints[last['input_fingerprint']] if last is not None and last['input_fingerprint'] in fingerprints else checkpoints[fingerprints[0]]
+      result = reported_checkpoint(self.cache, [checkpoints[key] for key in fingerprints])
       source_is_latest = result['completed_route'] == latest['routeId'] if 'completed_route' in result else result.get('source_is_latest', True)
-      return dict(result, source_is_latest=source_is_latest)
+      return dict(result, source_is_latest=source_is_latest, skipped_routes=[*result.get('skipped_routes', ()), *self.skipped_routes][:16])
     self.pending_input = (route, fingerprint)
+    revisions = source_revisions(self.root, route)
     state = {}
 
     def prior(cp):
-      scope = self.scope_for(cp, self.params)
+      try:
+        scope = self.scope_for(cp, self.params)
+      except VehicleIdentityUnavailable as error:
+        scope = None
+        state['review_identity'] = error.review_key
       raw, okay = read_saved(self.params, KEY, MAX_BYTES)
       if not okay:
         raise ValueError('Unreadable automatic tuning history')
-      row = decode(raw).get(NAMESPACE, {}).get(scope.key())
+      row = None if scope is None else decode(raw).get(NAMESPACE, {}).get(scope.key())
       state.update(scope=scope, raw=raw, row=row)
-      return dict(ZERO) if row is None else dict(row['values'])
+      from openpilot.starpilot.flm.manual_coordinates import selected_manual
+      manual = selected_manual(cp, self.params)
+      locked = {} if manual is None else {name: value for name, value in manual.values if name in manual.locked}
+      state['locked'] = locked
+      state['starting'] = {} if manual is None else manual.starting_values
+      current = dict(ZERO) | state['starting'] if row is None else dict(row['values'])
+      if any(current[name] != value for name, value in locked.items()):
+        raise ValueError('Saved automatic map conflicts with manually locked coordinates')
+      return current
 
     if self.on_analysis is not None:
       self.on_analysis()
     options: dict[str, Any] = {} if self.evidence_bank is None else {'evidence_bank': self.evidence_bank, 'history_identity': self._history_identity}
     if route != latest:
       options['selected_route'] = route
-    assessment = self.assessor(self.params, self.root, prior, permitted=self.permitted, **options)
-    if self.on_assessment is not None:
+    try:
+      assessment = self.assessor(self.params, self.root, prior, permitted=self.permitted, **options)
+    except RouteInputError as error:
+      if self.assessor is not RECORDED_ASSESSOR or error.route_id != route['routeId']:
+        raise
+      from openpilot.starpilot.flm.offroad_partial import analyze_partial
+
+      try:
+        assessment = analyze_partial(self.root, route['routeId'], prior, permitted=self.permitted)
+      except RouteInputError:
+        raise error from None
+      self._skip_route(route['routeId'], error)
+    from openpilot.starpilot.flm.offroad_route import PartialRouteReceipt
+
+    partial = type(assessment.receipt) is PartialRouteReceipt
+    partial_revisions = source_revisions(self.root, assessment.source_inventory) if partial else None
+    if self.on_assessment is not None and not partial:
       self.on_assessment(assessment)
     if not state:
       prior(assessment.cp)
     scope, row, expected = state['scope'], state['row'], state['raw']
 
+    def settings_current():
+      try:
+        current_scope = self.scope_for(assessment.cp, self.params)
+        return scope is not None and current_scope == scope
+      except VehicleIdentityUnavailable as error:
+        return scope is None and error.review_key == state.get('review_identity')
+
     def authorized():
       if not (
-        self.permitted() and self.scope_for(assessment.cp, self.params) == scope and latest_route(self.params, self.root, permitted=self.permitted) == latest
+        self.permitted() and settings_current()
+        and logger_marker(self.params) == self.pending_logger and source_revisions(self.root, route) == revisions
+        and latest_route(self.params, self.root, permitted=self.permitted, inventory_only=True) == latest
       ):
         return False
+      if partial:
+        from openpilot.starpilot.flm.offroad_partial import partial_inventory
+
+        return (partial_revisions == source_revisions(self.root, assessment.source_inventory)
+                and partial_inventory(self.root, route['routeId'], permitted=self.permitted) == assessment.source_inventory)
       if route == latest and assessment.source_inventory == route:
         return True
-      from openpilot.starpilot.galaxy.drive_history import DriveHistory
-
-      inventory = DriveHistory(self.root, max_segments_per_route=MAX_SEGMENTS).snapshot()
+      inventory = route_inventory(self.root)
       return not inventory['scanIncomplete'] and sum(r == assessment.source_inventory for r in inventory['routes']) == 1
 
     if not authorized():
@@ -522,12 +892,34 @@ class OffroadWorker:
       'analysis_counts': dict(assessment.counts),
       'recorded_tracking': assessment.recorded_tracking,
       'source_is_latest': assessment.receipt.route_id == latest['routeId'],
+      'skipped_routes': [*self.skipped_routes, *getattr(assessment, 'route_skips', ())][:16],
     }
     self.pending_failure_data = (authorized, recorded)
+    if partial:
+      recorded.update(partial_drive=True,
+                      partial_segments=[len(assessment.receipt.decoded_segments), len(assessment.receipt.segments)],
+                      omitted_segments=[list(row) for row in assessment.receipt.omitted_segments])
     report = assessment.report()
-    report.update(policy=POLICY, current_scope=scope.document(), road_improvement_confirmed=False)
-    current = dict(ZERO) if row is None else dict(row['values'])
+    report.update(policy=POLICY, road_improvement_confirmed=False)
+    if scope is not None:
+      report['current_scope'] = scope.document()
+    locked = state.get('locked', {})
+    current = dict(ZERO) | state.get('starting', {}) if row is None else dict(row['values'])
     recorded['recommendations'] = recorded_recommendations(assessment, current, report)
+
+    if scope is None:
+      recommendations = [r for r in recorded['recommendations'] if r['parameter'] not in locked]
+      report['vehicle_identity'] = 'unavailable'
+      result = {**recorded, 'status': 'collecting', 'reason': 'vehicle_identity_unavailable', 'vehicle_identity': 'unavailable',
+                'configuration_changed': False, 'actual_application_proven': False, 'road_improvement_confirmed': False,
+                'saved_adjustments': 0, 'manual_locked_parameters': list(locked), 'recommendations': recommendations,
+                'recommendation_count': len(recommendations),
+                'assessment_sha256': self.cache.put({'kind': 'identity_review', 'assessment': report})}
+      if not authorized() or read_saved(self.params, KEY, MAX_BYTES) != (expected, True):
+        raise RouteInputCancelled('Recording or settings changed before identity-limited review')
+      self.cache.checkpoint({'input_fingerprint': self._snapshot(route), 'result': result})
+      self.pending_failure_data = None
+      return result  # No fit, persistent evidence, trial resolution, profile load or Params write.
 
     choices = []
     for group in assessment.groups:
@@ -545,6 +937,18 @@ class OffroadWorker:
         if proposal is not None:
           proposal = dict(proposal, values=dict(current, **proposal['values']))
           choices.append((group, cohort, proposal))
+        coordinate_policy = {
+          ('torque_pid', 'steering_angle'): 'angle_tracking_supported26_v1',
+          ('torque', 'lateral_acceleration'): 'acceleration_center_deadbands_v1',
+        }.get((scope.controller_domain, metadata.get('domain')))
+        if coordinate_policy is not None:
+          for candidate in cohort.get('coordinate_candidates', ()):
+            if candidate.get('coordinate_policy') != coordinate_policy:
+              continue
+            name = candidate['parameter'].removeprefix('stable:')
+            candidate_values = dict(current, **{name: current[name] + candidate['delta']})
+            if proposal is None or candidate_values != proposal['values']:
+              choices.append((group, cohort, dict(candidate, values=candidate_values)))
     # Freeze all proposal sources before any controller/native fit. One
     # marginal tracking proposal must not hide the Recommended profile.
     short_groups = tuple(
@@ -555,9 +959,15 @@ class OffroadWorker:
         for c in group['cohorts']
       )
     ) if type(assessment) is CompletedAssessment else ()
+    raw_observed = [
+      (group['original_tracking_context_sha256'], source)
+      for group in assessment.diagnostic_groups for source in group.get('observed_sources', ())
+      if source['metadata']['domain'] == 'lateral_acceleration'
+      and recorded_source_contract(assessment.cp, source['metadata'], scope, self.params) is not None
+    ]
     if (
       type(assessment) is CompletedAssessment and (
-        assessment.stable_groups or short_groups or any(g.get('observed_original_windows') for g in assessment.groups)
+        assessment.stable_groups or short_groups or raw_observed or any(g.get('observed_original_windows') for g in assessment.groups)
       )
       and self.checker is qualify and scope.controller_domain == 'torque'
     ):
@@ -565,6 +975,22 @@ class OffroadWorker:
 
       selector = StableRouteSelector(assessment, self.root, current, scope, permitted=self.permitted)
       report['observed_profile_reports'] = []
+      for context, source in raw_observed:
+        # A diagnostic identity uses a different context key from the native
+        # windows, even when their source times overlap. Keep its reread and
+        # caches separate; diagnostics cannot invalidate native input roles.
+        observed_selector = StableRouteSelector(assessment, self.root, current, scope, permitted=self.permitted)
+        observed_selector.spans, observed_selector.contexts = {}, {}
+        observed_selector.include_observations(context, source['windows'])
+        proof = observed_selector.observe(tuple(w['identity'] for w in source['windows']))
+        proof['coordinate_candidates'] = [
+          candidate for candidate in proof['coordinate_candidates']
+          if all(source['coordinate_baselines'].get(name) == current[name] for name, target in candidate['values'].items() if target != current[name])
+        ]
+        report['observed_profile_reports'].append(dict(
+          proof, source_coordinate_baselines=source['coordinate_baselines'],
+          original_metadata_missing_rows=source['missing_metadata_rows'], diagnostic_tracking_only=True,
+        ))
       for group in assessment.groups:
         metadata = group['original_metadata']
         baseline = _recorded_values(metadata)
@@ -575,12 +1001,10 @@ class OffroadWorker:
         if baseline != current:
           source_selector = StableRouteSelector(assessment, self.root, baseline, scope, permitted=self.permitted)
           source_selector.rows = selector.rows
-        for condition in sorted({w['cohort'] for w in observed}):
-          ids = tuple(w['identity'] for w in observed if w['cohort'] == condition)
-          if 3 <= len(ids) <= 12:
-            _, proof = source_selector.profile(ids, condition)
-            selector.rows = source_selector.rows
-            report['observed_profile_reports'].append(dict(proof, source_baseline=baseline, automatic_application_allowed=False))
+        if observed:
+          proof = source_selector.observe(tuple(w['identity'] for w in observed))
+          selector.rows = source_selector.rows
+          report['observed_profile_reports'].append(dict(proof, source_baseline=baseline))
       report['stable_profile_reports'] = []
       for group in assessment.stable_groups:
         metadata = group['original_metadata']
@@ -591,12 +1015,12 @@ class OffroadWorker:
           continue
         report.setdefault('original_source_requalification', []).append(contract)
         for cohort in group['cohorts']:
-          if not all(role in cohort for role in ('training', 'heldout')):
-            continue
-          if 'qualification_roles' in cohort and any(len(cohort['qualification_roles'][role]['windows']) < 3 for role in ('training', 'heldout')):
+          if not all(3 <= len(cohort.get(role, {}).get('windows', ())) <= 12 for role in ('training', 'heldout')):
             continue
           proposal, proof = selector.propose(group, cohort)
           report['stable_profile_reports'].append({'context': group['original_context_sha256'], 'cohort': cohort['cohort'], **proof})
+          if 'qualification_roles' in cohort and any(len(cohort['qualification_roles'][role]['windows']) < 3 for role in ('training', 'heldout')):
+            continue  # Keep the observed suggestion; do not enqueue an automatic fit.
           if proposal is not None:
             choices.append((group, {**cohort, 'stable_profile_proof': proof}, proposal))
           for alternative in proof.get('coordinate_candidates', []):
@@ -616,23 +1040,48 @@ class OffroadWorker:
         for cohort in group['cohorts']:
           if cohort['cohort'].rsplit(':', 1)[-1] not in ('steady', 'turn_in', 'unwind'):
             continue
-          if not all(role in cohort for role in ('training', 'heldout')):
-            continue
-          roles = cohort.get('qualification_roles', cohort)
-          if any(not 3 <= len(roles[role]['windows']) <= 12 for role in ('training', 'heldout')):
+          if not all(3 <= len(cohort.get(role, {}).get('windows', ())) <= 12 for role in ('training', 'heldout')):
             continue
           _, proof = selector.propose(group, cohort)
           report['short_turn_profile_reports'].append({'context': group['original_context_sha256'], 'cohort': cohort['cohort'], **proof})
+          roles = cohort.get('qualification_roles', cohort)
+          if any(not 3 <= len(roles[role]['windows']) <= 12 for role in ('training', 'heldout')):
+            continue
           for alternative in proof.get('coordinate_candidates', []):
             choices.append((group, {**cohort, 'stable_profile_proof': proof}, alternative))
 
 
     def recommendations_ready():
-      recorded['recommendations'] = recorded_recommendations(assessment, current, report)
+      recorded['recommendations'] = [r for r in recorded_recommendations(assessment, current, report) if r['parameter'] not in locked]
+      recorded['manual_locked_parameters'] = list(locked)
+      if partial:
+        for recommendation in recorded['recommendations']:
+          if recommendation['target'] is not None:
+            recommendation['reason'] = 'partial_drive_provisional_only'
       if self.on_recommendations is not None:
         self.on_recommendations(dict(recorded))
 
     recommendations_ready()
+    choices = [(group, cohort, proposal) for group, cohort, proposal in choices
+               if all(proposal['values'][name] == value for name, value in locked.items())]
+    if partial:
+      recommendations = recorded['recommendations']
+      result = {**recorded, 'status': 'collecting', 'reason': 'partial_drive_provisional_only',
+                'partial_drive': True, 'partial_segments': [len(assessment.receipt.decoded_segments), len(assessment.receipt.segments)],
+                'omitted_segments': [list(row) for row in assessment.receipt.omitted_segments],
+                'configuration_changed': False, 'actual_application_proven': False, 'road_improvement_confirmed': False,
+                'recommendations': recommendations, 'recommendation_count': len(recommendations),
+                'assessment_sha256': self.cache.put({'kind': 'partial_assessment', 'assessment': report})}
+      if row is not None:
+        result.update(configured_values=dict(row['values']), configuration_state=row['state'],
+                      saved_adjustments=sum(value != 0 for value in row['values'].values()))
+      else:
+        result['saved_adjustments'] = 0
+      if not authorized() or read_saved(self.params, KEY, MAX_BYTES) != (expected, True):
+        raise RouteInputCancelled('Partial source or settings changed before checkpoint')
+      self.cache.checkpoint({'input_fingerprint': self._snapshot(route), 'result': result})
+      self.pending_failure_data = None
+      return result  # No native fit, trial resolution, evidence-bank insertion or Params write.
     reason = 'more_independent_eligible_tracking_required'
     status = 'collecting'
     saved = False
@@ -641,10 +1090,17 @@ class OffroadWorker:
     selected_profile_windows = 0
     actual_drive = getattr(assessment, 'single_drive', None)
     actual_drive = actual_drive if type(actual_drive) is CompletedAssessment else assessment
+    retained_comparison = None
+    if row is not None and row['state'] == 'retained_after_drive':
+      retained_comparison = assess_next_drive(
+        trial_document(self.cache, row['analysis_sha256']), actual_drive, scope, recorded_backlog=route != latest,
+        previous_segments=trial_segment_history(self.cache, row['analysis_sha256']),
+      )
     if row is not None and assessment.receipt.source_sha256 in row['route_sha256s']:
       reason = 'this_completed_drive_already_assessed'
-    elif row is not None and (row['state'] == 'ready_for_next_drive' or quality_withdrawn(actual_drive, scope, row['values'])):
-      trial = trial_document(self.cache, row['analysis_sha256'])
+    elif row is not None and (row['state'] == 'ready_for_next_drive' or quality_withdrawn(actual_drive, scope, row['values'])
+                             or retained_comparison is not None and retained_comparison['outcome'] == 'rolled_back'):
+      trial_sha256, trial = trial_origin(self.cache, row['analysis_sha256'])
       observed_checks = []
       if not quality_withdrawn(actual_drive, scope, row['values']):
         stable = trial['before']['training'].get('kind') == 'uncommanded_residual_v1'
@@ -659,15 +1115,37 @@ class OffroadWorker:
                 {'qualified': actual['qualified'] and contribution['qualified'], 'actual_recorded_map': actual, 'compared_with_prior_map': contribution}
               )
       started = os.path.lexists(self.cache.directory / ('trial-' + row['analysis_sha256'] + '.json'))
-      attempts = self.cache.get(row['analysis_sha256']).get('inconclusive_drives', 0)
-      if type(attempts) is not int or not 0 <= attempts < MAX_INCONCLUSIVE_DRIVES:
-        raise ValueError('Bounded inconclusive trial history required')
-      outcome = assess_next_drive(trial, actual_drive, scope, trial_started=started, recorded_backlog=route != latest)
+      previous_review = self.cache.get(row['analysis_sha256'])
+      attempts = previous_review.get('inconclusive_drives', 0)
+      if type(attempts) is not int or not 0 <= attempts <= 2**53 - 1:
+        raise ValueError('Valid inconclusive trial count required')
+      neutral_drives = previous_review.get('neutral_native_drives', 0)
+      if type(neutral_drives) is not int or not 0 <= neutral_drives <= 2:
+        raise ValueError('Valid verified neutral drive count required')
+      neutral_reviews = previous_review.get('neutral_native_reviews', [])
+      if (type(neutral_reviews) is not list or len(neutral_reviews) != neutral_drives
+          or any(type(d) is not str for d in neutral_reviews) or len(set(neutral_reviews)) != len(neutral_reviews)):
+        raise ValueError('Source-bound neutral review receipts required')
+      neutral_reviews = list(neutral_reviews)
+      neutral_routes = set()
+      for digest in neutral_reviews:
+        proof = self.cache.get(digest)
+        if proof.get('kind') != 'neutral_native_drive_review' or proof.get('trial_analysis_sha256') != trial_sha256:
+          raise ValueError('Neutral review belongs to another trial')
+        reviewed_route = proof.get('source_receipt', {}).get('route_id')
+        if type(reviewed_route) is not str or not reviewed_route or reviewed_route in neutral_routes:
+          raise ValueError('Distinct original neutral drives required')
+        neutral_routes.add(reviewed_route)
+      segments, history_complete = trial_source_history(self.cache, row['analysis_sha256'])
+      outcome = (retained_comparison if retained_comparison is not None else
+                 assess_next_drive(trial, actual_drive, scope, trial_started=started, recorded_backlog=route != latest,
+                                   previous_segments=segments))
+      history_limited = not history_complete and outcome['outcome'] != 'rolled_back' and outcome.get('counts_as_new_drive', True)
+      if history_limited:
+        outcome = dict(outcome, outcome='pending', reason='trial_source_history_capacity_reached', counts_as_new_drive=False)
       counts_as_new_drive = outcome.get('counts_as_new_drive', True)
       if outcome['outcome'] == 'pending' and started and counts_as_new_drive:
-        attempts += 1
-        if attempts >= MAX_INCONCLUSIVE_DRIVES:
-          outcome = dict(outcome, outcome='rolled_back', reason='trial_inconclusive_drive_limit')
+        attempts = min(attempts + 1, 2**53 - 1)
       if outcome['outcome'] == 'accepted_after_drive' and (not observed_checks or not all(r['qualified'] for r in observed_checks)):
         outcome = {
           'outcome': 'rolled_back',
@@ -676,18 +1154,39 @@ class OffroadWorker:
           'causal_road_benefit_proven': False,
           'comparisons': outcome['comparisons'],
         }
-      if outcome['outcome'] == 'pending' and (not started or not counts_as_new_drive):
+      from openpilot.starpilot.flm.offroad_route import original_segment_hashes
+
+      for receipt in (report['route'], *report.get('evidence_sources', ())):
+        segments.update(original_segment_hashes(receipt.get('segments', ())))
+      history_complete &= len(segments) <= MAX_TRIAL_SEGMENTS
+      if (started and counts_as_new_drive and history_complete and len(actual_drive.evidence_sources) <= 1
+          and actual_drive.receipt.route_id not in neutral_routes and original_segment_hashes(actual_drive.receipt.segments)
+          and neutral_native_review(outcome, observed_checks)):
+        neutral_reviews.append(self.cache.put({
+          'kind': 'neutral_native_drive_review', 'trial_analysis_sha256': trial_sha256,
+          'source_receipt': asdict(actual_drive.receipt), 'comparisons': outcome['comparisons'],
+          'all_actual_next_drive_checks': observed_checks,
+        }))
+        neutral_drives = min(neutral_drives + 1, 2)
+        if neutral_drives == 2:
+          outcome = dict(outcome, outcome='retained_after_drive', reason='independent_actual_tracking_stable')
+      if outcome['outcome'] == 'pending' and (not started or not counts_as_new_drive and not history_limited):
         status, reason = 'ready_for_next_drive', outcome['reason']
         report['unused_recording_review'] = outcome
         report['recorded_tracking'] = trial.get('assessment', {}).get('recorded_tracking')
       else:
+        # shortcut: beyond 4096 source segments retain the tune; require a new trial before crediting more evidence.
         record = {
           'kind': 'next_drive_outcome',
           'policy': POLICY,
-          'trial_analysis_sha256': row['analysis_sha256'],
+          'trial_analysis_sha256': trial_sha256,
+          'trial_source_segments': sorted(segments)[:MAX_TRIAL_SEGMENTS],
+          'trial_source_history_complete': history_complete,
           'assessment': report,
           'all_actual_next_drive_checks': observed_checks,
           'inconclusive_drives': attempts,
+          'neutral_native_drives': neutral_drives,
+          'neutral_native_reviews': neutral_reviews,
           **outcome,
         }
         digest = self.cache.put(record)
@@ -713,10 +1212,7 @@ class OffroadWorker:
       for group, cohort, proposal in choices:
         selected_profile_windows = cohort['whole_windows']
         offered = {'values': proposal['values'], 'parameter': proposal['parameter'], 'delta': proposal['delta']}
-        blocked = False
-        if row is not None and row['state'] == 'rolled_back':
-          trial = trial_document(self.cache, row['analysis_sha256'])
-          blocked = trial['parameter'] == proposal['parameter'] and trial['delta'] == proposal['delta']
+        blocked = rejected_trial_change(self.cache, row, proposal)
         if blocked:
           reason = 'same_rejected_change_requires_different_evidence_or_reset'
           continue
@@ -764,15 +1260,19 @@ class OffroadWorker:
             if fitted is not None:
               proposal = fitted
               offered = {'values': proposal['values'], 'parameter': proposal['parameter'], 'delta': proposal['delta']}
-              if row is not None and row['state'] == 'rolled_back':
-                trial = trial_document(self.cache, row['analysis_sha256'])
-                feasible = not (trial['parameter'] == proposal['parameter'] and trial['delta'] == proposal['delta'])
+              feasible = not rejected_trial_change(self.cache, row, proposal)
           if not feasible:
             reason = 'no_new_native_feasible_training_step'
             if independent_checks is not None:
               break
             continue
           else:
+            refusal = newer_original_refusal(self.cache, assessment.receipt, scope, proposal['values'])
+            if refusal is not None:
+              report['newer_original_refusal'] = refusal
+              report['refused_parameters'] = [name for name in NAMES if proposal['values'][name] != current[name]]
+              reason = 'newer_drive_refused_same_adjustment'
+              break
             checked = (
               independent_checks
               if independent_checks is not None
@@ -837,12 +1337,10 @@ class OffroadWorker:
               def original_sources_current(new=new):
                 if not authorized():
                   return False
-                from openpilot.starpilot.galaxy.drive_history import DriveHistory
-
                 required = [s.source_inventory for s in assessment.evidence_sources.values() if s.receipt.source_sha256 in new['route_sha256s']]
                 if not required:
                   return True
-                inventory = DriveHistory(self.root, max_segments_per_route=MAX_SEGMENTS).snapshot()
+                inventory = route_inventory(self.root)
                 return not inventory['scanIncomplete'] and all(sum(r == source for r in inventory['routes']) == 1 for source in required)
 
               saved = RouteStorage(self.params).save(new, expected=expected, authorized=original_sources_current)
@@ -852,6 +1350,9 @@ class OffroadWorker:
               reason = 'bounded_trial_configured_for_next_drive'
             else:
               reason = checked.get('reason', 'original_controller_or_registered_encoder_check_refused')
+              if any(name in ('candidate encoder clipping regression', 'candidate changed an actual limiter/support')
+                     for name, _ in qualification_summary(checked)['refusals']):
+                report['refused_parameters'] = [name for name in NAMES if proposal['values'][name] != current[name]]
             break
       if not saved and offered is not None and offered['parameter'].startswith('stable:'):
         profile_suggestions = [
@@ -883,7 +1384,7 @@ class OffroadWorker:
     result = {
       'status': status,
       'reason': reason,
-      'configuration_changed': saved,
+      'configuration_changed': saved and status != 'retained_after_drive',
       'policy': POLICY,
       'completed_route': assessment.receipt.route_id,
       'source_is_latest': assessment.receipt.route_id == latest['routeId'],
@@ -894,8 +1395,10 @@ class OffroadWorker:
       'source_sha256': assessment.receipt.source_sha256,
       'vehicle': str(assessment.cp.carFingerprint),
       'recorded_tracking': report.get('recorded_tracking'),
+      'skipped_routes': [*self.skipped_routes, *getattr(assessment, 'route_skips', ())][:16],
       'suggestion_count': len(diagnostics) + len(profile_suggestions),
-      'recommendations': recorded_recommendations(assessment, current, report),
+      'recommendations': [r for r in recorded_recommendations(assessment, current, report) if r['parameter'] not in locked],
+      'manual_locked_parameters': list(locked),
       'suggestions': profile_suggestions
       + [
         {'parameter': v['parameter'], 'delta': v['delta'], 'whole_windows': c['whole_windows'], 'qualification': 'controller_native_checks_not_passed'}
@@ -920,7 +1423,9 @@ class OffroadWorker:
     # A new started/changed source cannot be marked processed under its new ID.
     if not authorized():
       raise ValueError('Offroad source changed before checkpoint')
+    if self.evidence_bank is not None:
+      result['evidence_revision'] = self.evidence_bank.revision()
     self.cache.checkpoint({'input_fingerprint': self._snapshot(route), 'result': result})
     self.pending_failure_data = None
-    return result
+    return recent_findings(self.cache, [result, *[row['result'] for row in self.cache.checkpoints()]], result)
 

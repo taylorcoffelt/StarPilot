@@ -2,13 +2,14 @@ name: FLM offroad contracts
 
 on:
   push:
-    branches: [Dom]
+    branches: [Dom, StarPilot, stable, testing, dev]
     paths:
       - 'openpilot/starpilot/flm/**'
       - 'openpilot/starpilot/lateral/**'
       - 'openpilot/starpilot/aol/**'
       - 'openpilot/starpilot/galaxy/web/js/flm*.js'
       - 'openpilot/starpilot/galaxy/tests/test_flm*.mjs'
+      - 'openpilot/starpilot/galaxy/drive_history.py'
       - 'openpilot/selfdrive/controls/lib/latcontrol*'
       - 'openpilot/selfdrive/controls/controlsd.py'
       - 'openpilot/system/manager/process_config.py'
@@ -72,9 +73,18 @@ jobs:
           tools/op.sh test \
             openpilot/starpilot/flm/tests/test_offroad_backend.py \
             openpilot/starpilot/flm/tests/test_offroad_coordinate_policy.py \
+            openpilot/starpilot/flm/tests/test_offroad_retained_trials.py \
+            openpilot/starpilot/flm/tests/test_offroad_process_lifecycle.py \
+            openpilot/starpilot/flm/tests/test_route_recording_clocks.py \
+            openpilot/starpilot/flm/tests/test_configured_route_recording.py \
+            openpilot/starpilot/flm/tests/test_observed_maneuvers.py \
+            openpilot/starpilot/flm/tests/test_pid_coordinate_proposals.py \
             openpilot/starpilot/flm/tests/test_offroad_equal_native_output.py \
+            openpilot/starpilot/flm/tests/test_offroad_fault_isolation.py \
+            openpilot/starpilot/galaxy/tests/test_drive_history.py \
             --json-output ci-results/flm-offroad.json
           .venv/bin/python -m pytest -q --import-mode=importlib \
+            openpilot/starpilot/flm/tests/test_observed_maneuvers.py \
             openpilot/starpilot/flm/tests/test_upstream_producer_transport.py \
             openpilot/starpilot/flm/tests/test_clock_resolution_budget.py \
             openpilot/starpilot/flm/tests/test_consumption_join_clocks.py \
@@ -89,6 +99,10 @@ jobs:
         run: |
           node openpilot/starpilot/galaxy/tests/test_flm_training_results.mjs
           node openpilot/starpilot/galaxy/tests/test_flm_tracking_results.mjs
+          node openpilot/starpilot/galaxy/tests/test_flm.mjs
+          node openpilot/starpilot/galaxy/tests/test_tuning_editor.mjs
+          node openpilot/starpilot/galaxy/tests/test_settings_defaults.mjs
+          node openpilot/starpilot/galaxy/tests/test_flm_ux_browser.mjs
       - name: Retain offroad contract results
         if: always()
         uses: actions/upload-artifact@v4
