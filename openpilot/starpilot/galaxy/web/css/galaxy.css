@@ -421,6 +421,8 @@ transition: background-color var(--motion-fast), transform var(--motion-fast);
 width: var(--touch-target);
 }
 .gx-icon-btn:hover { background: var(--glass-bg-hover); }
+.gx-home__hero.gx-page-header { flex-direction: row; }
+.gx-icon-btn.gx-wiki-help { flex: none; color: var(--on-surface-variant); text-decoration: none; }
 .gx-icon-btn:active { transform: scale(0.9); }
 .gx-icon-btn i,
 .gx-appbar .bi,
@@ -946,6 +948,8 @@ background: var(--glass-bg-hover);
 .gx-starport-log__download { flex: none; width: var(--touch-target); height: var(--touch-target); border: 1px solid var(--glass-border); background: var(--primary-container); color: var(--on-primary-container); }
 .gx-starport-log__download:hover { background: var(--primary); color: var(--on-primary); }
 .gx-starport-logs__section-title { margin: var(--sp-6) 0 var(--sp-3); }
+.gx-starport-send__fork { justify-content: center; text-align: center; margin-block: var(--sp-4); }
+.gx-starport-send__fork .gx-alert__body { flex: 0 1 auto; }
 .gx-starport-send__row { display: grid; gap: var(--sp-3); margin-top: var(--sp-3); }
 .gx-starport-send__row .gx-field { width: 100%; box-sizing: border-box; }
 .gx-starport-send__field { position: relative; }
@@ -1884,6 +1888,8 @@ progress { max-width: 100%; accent-color: var(--primary); }
 .gx-app-download h2 { margin: 0; font-size: 1.5rem; line-height: 1.2; }
 .gx-app-download > p { margin: 0; color: var(--text-muted); line-height: 1.5; }
 .gx-app-download__get { width: 100%; min-height: 48px; }
+.gx-app-download__actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; width: 100%; }
+.gx-app-download__actions > .gx-btn { min-width: 0; min-height: 48px; padding-inline: 8px; white-space: normal; }
 .gx-app-download > .gx-app-download__platform { margin-top: -8px; font-size: .75rem; }
 .gx-app-download > .gx-btn--text { background: transparent; border-color: transparent; box-shadow: none; color: var(--text-muted); min-height: 44px; }
 

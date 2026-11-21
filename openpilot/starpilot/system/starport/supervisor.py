@@ -43,6 +43,8 @@ from openpilot.starpilot.system.starport.bugsink_report import PairingAttempt
 from openpilot.starpilot.system.starport.frame_source import (DEFAULT_PATH as DEFAULT_FRAME_PATH, FLAG_ASYNC_READBACK, FLAG_NV12,
                                                                   FORMAT_NV12, FrameRequest)
 from openpilot.starpilot.system.starport.projection_control import DEFAULT_CONTROL_SOCKET, NATIVE_FOCUS
+from openpilot.starpilot.system.starport.radio_watch import (RADIO_CHANGE_WINDOW as RADIO_CHANGE_WINDOW,
+                                                           RADIO_CHECK_INTERVAL as RADIO_CHECK_INTERVAL, SharedRadioWatch)
 from openpilot.starpilot.system.starport.touch import DEFAULT_TOUCH_SOCKET, TouchEvent
 from openpilot.starpilot.system.starport.view import CAR_FRAME_PATH, ViewSource, renderer_available
 from openpilot.starpilot.system.starport.session import CODEC_H265, AuthenticationRejected, PeerRequestedStop, ProjectionSession, SharedRadioStall
@@ -58,6 +60,8 @@ UNAVAILABLE_AFTER = 1.0      # focused but no fresh UI frame for this long -> "u
 SDP_SETTLE = (1.5, 2.2, 3.0)
 TCP_ATTEMPTS = 6
 PATIENT_TCP_SECONDS = 60.0  # owner toggle: keep retrying a refused projection connection this long
+STANDARD_AA_PORT = 5288
+VERSION_WAIT_SECONDS = 90.0
 MAX_LOG_FILES = 20
 LOG_QUEUE_MAX = 1000          # session log records waiting for the writer; past this they are dropped and counted
 ENCODER_RECOVERIES = 3       # hardware encoder reopens allowed per window before the session is torn down
@@ -76,13 +80,26 @@ USB_CONFIGURE_WAIT = 15.0    # slower receivers need time to enumerate after the
 LINK_CHECK_INTERVAL = 1.0    # how often the link watcher asks whether the car's Wi-Fi is still up
 LINK_CHECK_SLOW = 1.0        # a link check slower than this is logged (NetworkManager answers over D-Bus)
 STREAM_STALL_LOG = 1.0       # a streaming loop pass slower than this is logged
-RADIO_CHECK_INTERVAL = 0.5   # how often the comma's own Wi-Fi is checked for a join or roam (a sysfs read)
-RADIO_CHANGE_WINDOW = 15.0   # a join or roam this recent can still stall the car (11-02: stall came 7.5 s after a roam)
 STALL_CAPTURE_S = 20.0       # device logs kept from before a shared-radio stall is reported
 REPORTED_SETTINGS = ("connection", "usb_mode", "view", "encoder", "fps", "bitrate_kbps", "rate_control", "gpu_nv12",
                      "async_readback", "wifi_interface", "dedicated_wifi_interface", "verify_head_unit", "version_status",
                      "rfcomm_channel", "phone_class", "auto_connect", "allow_hevc", "keyframe_test", "tall_hevc",
                      "unacked_video", "patient_tcp", "head_unit_experiments", "head_unit_experiment_rules")
+
+
+def _open_projection(ip: str, ports: list[int], advertised: int, local_ip: str, log) -> socket.socket:
+  error: OSError | None = None
+  for port in ports:
+    try:
+      sock = socket.create_connection((ip, port), timeout=5.0, source_address=(local_ip, 0) if local_ip else None)
+    except OSError as failure:
+      error = error or failure  # the first port's failure decides how patiently to retry
+      continue
+    if port != advertised:
+      log("tcp_port_fallback", advertised=advertised, port=port)
+    return sock
+  assert error is not None
+  raise error
 
 
 def _tcp_failure_kind(error: OSError) -> str:
@@ -274,74 +291,6 @@ class LinkWatch:
           self.log("link_lost", reason=self.lost, wifi_dbm=self.wifi_dbm)
           return
       self._stop.wait(self.interval)
-
-
-class SharedRadioWatch:
-  """Notices the comma's own Wi-Fi joining or roaming while the car is on aa0; both share one radio.
-
-  The link going down or up bumps carrier_changes, a plain sysfs read. The network's name is never read or logged.
-  """
-
-  def __init__(self, log: Callable[..., None], interface: str = "wlan0", interval: float = RADIO_CHECK_INTERVAL,
-               counter: Path | None = None, carrier: Path | None = None, on_down: Callable[[], None] | None = None,
-               on_stall: Callable[[], None] | None = None):
-    self.log, self.interface, self.interval = log, interface, interval
-    self.counter = counter or Path(f"/sys/class/net/{interface}/carrier_changes")
-    self.carrier = carrier or Path(f"/sys/class/net/{interface}/carrier")
-    self.on_down = on_down  # the other network was lost, not just roamed
-    self.on_stall = on_stall  # the car's acks stopped after a change that has not connected yet
-    self.changed_at: float | None = None
-    self._stop = threading.Event()
-    self._thread = threading.Thread(target=self._run, name="aa_radio_watch", daemon=True)
-
-  def start(self) -> SharedRadioWatch:
-    self._thread.start()
-    return self
-
-  def stop(self) -> None:
-    self._stop.set()
-
-  def recent(self, now: float | None = None) -> bool:
-    """Whether the other network joined or roamed within RADIO_CHANGE_WINDOW."""
-    changed_at = self.changed_at
-    now = time.monotonic() if now is None else now
-    return changed_at is not None and now - changed_at <= RADIO_CHANGE_WINDOW
-
-  def _read(self) -> str | None:
-    try:
-      return self.counter.read_text().strip()
-    except OSError:
-      return None
-
-  def _run(self) -> None:
-    last = self._read()
-    while not self._stop.wait(self.interval):
-      current = self._read()
-      if current is None or current == last:
-        continue
-      last = current
-      self.changed_at = time.monotonic()
-      self.log("other_wifi_changed", interface=self.interface)
-      if self.on_down is not None and not self._carrier():
-        try:
-          self.on_down()
-        except Exception as error:
-          self.log("other_wifi_hold_failed", error=str(error) or type(error).__name__)
-
-  def stalled(self) -> None:
-    # A join that already connected has only its address left. Stopping it there lost the hotspot and still
-    # dropped the car on 2026-11-16, while a joined hotspot then streamed alongside the car for minutes.
-    if self._carrier():
-      self.log("other_wifi_join_kept", interface=self.interface)
-      return
-    if self.on_stall is not None:
-      self.on_stall()
-
-  def _carrier(self) -> bool:
-    try:
-      return self.carrier.read_text().strip() == "1"
-    except OSError:
-      return False  # reading carrier of a down interface fails with EINVAL
 
 
 class EventLog:
@@ -1543,7 +1492,7 @@ class Supervisor:
     software = device_metadata()
     profile, profile_source = car_profiles.resolve(self.config)
     self.log("session_start", receiver=receiver, generation=generation, trigger=trigger,
-             software={key: software.get(key, "unknown") for key in ("commit", "branch")},
+             software={key: software.get(key, "unknown") for key in ("repo", "commit", "branch")},
              settings={key: self.config.get(key) for key in REPORTED_SETTINGS},
              # What the owner chose, so a report can tell a built-in unit from a dongle and say which profile applied.
              setup={"type": {"wired": "usb", "headunitpad": "app", "openheadunit": "app"}.get(connection) or self.car_type(),
@@ -1697,7 +1646,7 @@ class Supervisor:
     # only when a car that answered the handshake keeps refusing it before any video.
     with self._lock:
       base_modern = self._modern_reply.get(address, config.get("modern_reply_cache", {}).get(address, False))
-      strategy = self._strategy = self._ladder.strategy(address, base_modern)
+      strategy = self._strategy = self._ladder.strategy(address, base_modern, unofficial)
       learned = self._ladder.snapshot(address, adapter, unofficial)["learned"]
       tries = self._ladder.tried(address, strategy.rung)
     self.log("ladder_strategy", rung=strategy.rung, label=strategy.label, learned=learned, modern_reply=strategy.modern_reply,
@@ -1737,7 +1686,7 @@ class Supervisor:
                                       video_seen=self._video_seen, version_major=boot.version_major if boot is not None else 0,
                                       adapter=adapter, unofficial=unofficial)
         if outcome:
-          self.log("ladder_failed", outcome=outcome, rung=strategy.rung, next=self._ladder.strategy(address, base_modern).rung,
+          self.log("ladder_failed", outcome=outcome, rung=strategy.rung, next=self._ladder.strategy(address, base_modern, unofficial).rung,
                    version_major=boot.version_major, reason="rejected_reply" if rejected else "timeout", why=reason)
         elif boot is not None and isinstance(error, BootstrapTimeout) and error.stage == "wifi_start" and boot.only_not_ready():
           self.log("ladder_not_ready", rung=strategy.rung, refusals=len(boot.refusals))
@@ -2031,11 +1980,13 @@ class Supervisor:
     last_error: Exception | None = None
     patient_until = time.monotonic() + PATIENT_TCP_SECONDS if self.config["patient_tcp"] else 0.0
     attempt = 0
+    advertised = result.endpoint.port
+    # Some dongles advertise one port but listen on the standard one
+    ports = list(dict.fromkeys((advertised, STANDARD_AA_PORT)))
     while True:
       self._check_cancel()
       try:
-        sock = socket.create_connection((result.endpoint.ip, result.endpoint.port), timeout=5.0,
-                                        source_address=(lease.local_ip, 0) if lease.local_ip else None)
+        sock = _open_projection(result.endpoint.ip, ports, advertised, lease.local_ip, self.log)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return self._track(sock)
       except OSError as error:
@@ -2078,7 +2029,8 @@ class Supervisor:
     config = self.config
     sock = connect() if connect is not None else self._connect_tcp(result, lease)
     ca = ident.root if config.get("verify_head_unit", False) else None
-    session = ProjectionSession(sock, ident.cert, ident.key, self.log, ca)
+    version_wait = VERSION_WAIT_SECONDS if self.car_type() == "adapter" else None
+    session = ProjectionSession(sock, ident.cert, ident.key, self.log, ca, version_wait=version_wait)
     session.fragment_acks = fragment_acks
     tuning = car_profiles.tuning(config)
     session.max_window = tuning["max_window"]
